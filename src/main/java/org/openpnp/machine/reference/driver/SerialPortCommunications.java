@@ -4,7 +4,6 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.concurrent.TimeoutException;
 
-import eu.settlabs.core.interfaces.Writable;
 import eu.settlabs.streams.BaseStream;
 import eu.settlabs.streams.serialport.SerialStream;
 import org.simpleframework.xml.Attribute;
@@ -102,6 +101,7 @@ public class SerialPortCommunications extends ReferenceDriverCommunications {
         disconnect();
 
         stream = new SerialStream(portName);
+        stream.setEol("\n");
         stream.setPort(portName);
         stream.initAndConnect();
 

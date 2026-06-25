@@ -28,6 +28,7 @@ public class GcodeWriter implements Writable {
         this.controller = controller;
         if( controller.isWritable()) {
             writer = (Writable) controller;
+            controller.addTarget(this);
         }
         this.rules = rules;
     }
@@ -88,6 +89,7 @@ public class GcodeWriter implements Writable {
             return state;
         }
         var cmd = pendingCommands.getFirst();
+        System.out.println("Sending:"+cmd.command());
         if( writer.writeLine(id(),cmd.command()) ) {
             cmd.markSendOk();
             timeoutFuture = timedExecutor.schedule(this::timeoutOccurred, cmd.timeout(), TimeUnit.MILLISECONDS);
@@ -124,6 +126,7 @@ public class GcodeWriter implements Writable {
     /* ***** Writable  **** */
     @Override
     public boolean writeLine(String origin, String msg) {
+        System.out.println("Received:"+msg);
         // Anything received is assumed to be a reply to what was last send
         // Do this first just to be sure it won't trigger during processing
         if( timeoutFuture != null ) {
@@ -135,16 +138,18 @@ public class GcodeWriter implements Writable {
         }
         // Got a line and it matches the regex
         var item = pendingCommands.getFirst(); // Peeks at the top, doesn't remove it yet
-        item.markReplied();
+        item.markReplied(msg);
         if( item.command().startsWith("$") ){
             state = STREAM_STATE.WAITING;
             timedExecutor.schedule(this::stopWaiting,rules.getDollarWaitTimeMilliseconds(),TimeUnit.MILLISECONDS);
         }
         if( !rules.isErrorMessage(msg) ){ // Or try again logic?
             pendingCommands.removeFirst();
-            if( rules.isConfirmationMessage(msg) ) {
-                item.markConfirmed();
+            if( item.isConfirmed() ) {
+                System.out.println("confirmed:"+item.command());
                 org.pmw.tinylog.Logger.trace("[{}] confirmed {}", id(), item.command());
+            }else{
+                System.out.println("NOT confirmed:"+item.command());
             }
             if( !pendingCommands.isEmpty() ){
                 sendCommand();

@@ -496,13 +496,14 @@ public class AltGCodeDriver extends GcodeDriver {
                                 throw new RuntimeException(e);
                             }
                         break;
-                        case CONFIRMED :
+                        case CONFIRMED,CONFIRM_REGEX_FAILED:
                             if( cmd.isLocationReply() ){
                                 processPositionReport( new Line(cmd.reply()) );
                             }else if( cmd.hasFuture() ){
                                 cmd.completeFuture();
                             }
-                            cmd.doConfirmation();
+                            if( cmd.isConfirmed())
+                                cmd.doConfirmation();
                             break;
                         case ERROR :
                             org.pmw.tinylog.Logger.error("{} error response from controller: {}", cmd.reply(), gcodeWriter.id());

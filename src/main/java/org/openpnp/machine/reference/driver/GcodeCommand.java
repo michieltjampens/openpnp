@@ -17,7 +17,7 @@ public class GcodeCommand {
     private Runnable onTimeOut=()->{};
     private COMMAND_STATE state=COMMAND_STATE.PENDING;
 
-    public enum COMMAND_STATE{PENDING,SEND,FAILED_SEND,CONFIRMED,ERROR,TIMEOUT, MAYBE_LOCATION, UNSOLICITED};
+    public enum COMMAND_STATE{PENDING,SEND,FAILED_SEND,CONFIRMED,CONFIRM_REGEX_FAILED,ERROR,TIMEOUT, MAYBE_LOCATION, UNSOLICITED};
 
     private GCODE_COMMAND gcode=GCODE_COMMAND.STD;
 
@@ -92,7 +92,9 @@ public class GcodeCommand {
     public boolean isLocationReply(){
         return gcode==GCODE_COMMAND.LOCATION;
     }
-
+    public boolean isConfirmed(){
+        return state==COMMAND_STATE.CONFIRMED;
+    }
     public CompletableFuture<String> createReplyFuture(){
         gcode = GCODE_COMMAND.REPLY_FUTURE;
         future = new CompletableFuture<>();
@@ -106,7 +108,7 @@ public class GcodeCommand {
     }
     public void completeFuture(){
         if(future != null) {
-            future.complete(reply);
+            future.complete(isConfirmed()?reply:null);
         }
     }
     /* **** Changing the state of the command **** */
@@ -118,9 +120,10 @@ public class GcodeCommand {
         sendTimestamp= Instant.now().toEpochMilli();
         state=COMMAND_STATE.FAILED_SEND;
     }
-    public void markReplied(){
+    public void markReplied(String reply){
+        this.reply=reply;
         replyTimestamp= Instant.now().toEpochMilli();
-        state=COMMAND_STATE.MAYBE_LOCATION;
+        state=confirmRegex.test(reply)?COMMAND_STATE.CONFIRMED:COMMAND_STATE.CONFIRM_REGEX_FAILED;
     }
     public void markTimedOut(){
         state=COMMAND_STATE.TIMEOUT;
