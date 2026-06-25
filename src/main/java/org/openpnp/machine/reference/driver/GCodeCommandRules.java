@@ -1,6 +1,5 @@
 package org.openpnp.machine.reference.driver;
 
-import java.util.function.Predicate;
 import java.util.regex.Pattern;
 
 public class GCodeCommandRules {

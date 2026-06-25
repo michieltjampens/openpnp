@@ -323,7 +323,7 @@ public class GcodeDriver extends AbstractReferenceDriver implements Named {
     protected LinkedBlockingQueue<Line> receivedConfirmationsQueue = new LinkedBlockingQueue<>();
 
     protected Line errorResponse;
-    private boolean motionPending;
+    protected boolean motionPending;
 
     private PrintWriter gcodeLogger;
 

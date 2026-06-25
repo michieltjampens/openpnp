@@ -6,9 +6,9 @@ public class GCodeTools {
 
     public static String preProcessCommand(String command, GCodeCommandRules rules) {
 
-        if ( !rules.needsCleaning())
-            return rules.isBackslashEscapedCharactersEnabled()? unescape(command):command;
-
+        if ( !rules.needsCleaning()) {
+            return rules.isBackslashEscapedCharactersEnabled() ? unescape(command) : command;
+        }
         // See http://linuxcnc.org/docs/2.4/html/gcode_overview.html
         boolean insideComment = false;
         boolean decimal = false;

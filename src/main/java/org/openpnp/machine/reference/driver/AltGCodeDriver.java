@@ -1,85 +1,108 @@
 package org.openpnp.machine.reference.driver;
 
+import org.openpnp.machine.reference.ReferenceActuator;
 import org.openpnp.machine.reference.ReferenceMachine;
+import org.openpnp.machine.reference.SimulationModeMachine;
 import org.openpnp.model.AxesLocation;
 import org.openpnp.model.Configuration;
 import org.openpnp.spi.*;
 import org.tinylog.Logger;
 
-import java.io.IOException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class AltGCodeDriver extends GcodeDriver {
 
-    GcodeProcessor gcodeWriter;
+    GcodeWriter gcodeWriter;
     GCodeCommandRules rules = new GCodeCommandRules();
     boolean checkResponses =true;
     ResponseThread responseThread;
 
-    public AltGCodeDriver(GcodeProcessor gcodeWriter, GCodeCommandRules rules) {
-        this.gcodeWriter = gcodeWriter;
-        this.rules = rules;
-
-        startResponseHandler();
-    }
     public void startResponseHandler(){
         responseThread = new ResponseThread();
         responseThread.setDaemon(true);
         responseThread.start();
     }
     @Override
-    protected void sendGcode(String gCode, long timeout) throws Exception {
-         if( gcodeWriter == null ){
-             Logger.error("No valid gcode writer available");
-             return;
-         }
-        if (timeout == -1) {
-            timeout = infinityTimeoutMilliseconds;
-        }
-        var cmd = PendingCommand.create(gCode).timeout( timeout );
-        var result = gcodeWriter.sendGcode( cmd );
-        // Do something with the result?
+    public void sendCommand(String command) throws Exception {
+        sendGcode(GcodeCommand.create(command).timeout( timeoutMilliseconds ));
     }
-    protected void sendGcode( PendingCommand gCode ){
+    public void sendCommand(String command, long timeout) throws Exception {
+        sendGcode(GcodeCommand.create(command).timeout( timeout ));
+    }
+    @Override
+    protected void sendGcode(String gCode, long timeout) throws Exception {
+        sendGcode( GcodeCommand.create(gCode).timeout( timeout ) );
+    }
+    protected void sendGcode( GcodeCommand gCode ){
         if( gcodeWriter == null ){
             Logger.error("No valid gcode writer available");
             return;
         }
+        if ( gCode.timeout() == -1) {
+            gCode.timeout( infinityTimeoutMilliseconds);
+        }
+        gcodeWriter.sendGcode( gCode );
+    }
+    protected CompletableFuture<String> sendGcodeGetReplyFuture( GcodeCommand gCode){
+        gCode.createReplyFuture();
+        sendGcode(gCode);
+        return gCode.replyFuture();
+    }
 
-        var result = gcodeWriter.sendGcode( gCode );
-        // Do something with the result?
-    }
-    public void disableMachine() throws Exception {
-        Configuration.get().getMachine().setEnabled(false);
-    }
-    public void sendCommand(String command, long timeout) throws Exception {
-        // An error may have popped up in the meantime. Check and bail on it, before sending the next command.
-        bailOnError();
-
-        // After sending this, we want one more confirmation.
-        // TODO: true queued reporting. For now it is sufficient to poll one for one.
-        receivedConfirmationsQueue.clear();
-        try {
-            // Send the command.
-            getCommunications().writeLine(command);
-        }
-        catch (IOException ex) {
-            org.pmw.tinylog.Logger.error(ex, "{} failed to write command {}", getCommunications().getConnectionName(), command);
-            disconnect();
-            Configuration.get().getMachine().setEnabled(false);
-        }
-        waitForConfirmation(command, timeout);
-        if (command.startsWith("$")) {
-            Thread.sleep(dollarWaitTimeMilliseconds);
-        }
-    }
     public void setCommand(HeadMountable hm, CommandType type, String text) {
-        setCommand(hm, type, text);
+        super.setCommand(hm, type, text);
         if(type==CommandType.COMMAND_CONFIRM_REGEX){
             rules.setConfirmCommandRegex(text);
         }else if(type==CommandType.COMMAND_ERROR_REGEX){
             rules.setErrorCommandRegex(text);
         }
+    }
+    private String waitForReply(CompletableFuture<String> future ) {
+        try {
+            return future.get(timeoutMilliseconds, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException | InterruptedException | ExecutionException e) {
+            Logger.error("Timeout while waiting for firmware report");
+        }
+        return null;
+    }
+    @Override
+    protected void detectFirmwareSequence() throws Exception {
+        org.pmw.tinylog.Logger.debug("=== Detecting firmware and position reporting, please ignore any errors and warnings.");
+
+        var replyFuture =  sendGcodeGetReplyFuture( GcodeCommand.create("M115").confirmRegex("^.*FIRMWARE.*") );
+        String firmware = waitForReply(replyFuture);
+        if (firmware != null) {
+            setDetectedFirmware(firmware);
+        }
+
+        replyFuture = sendGcodeGetReplyFuture( GcodeCommand.create("M114").confirmRegex(".*[XYZABCDEUVW]:-?\\d+\\.\\d+.*") );
+        String reportedAxes = waitForReply(replyFuture);
+        if (reportedAxes != null) {
+            if (firmware != null) {
+                try {
+                    if (getFirmwareProperty("FIRMWARE_NAME", "").contains("Duet")) {
+                        var M584reply = sendGcodeGetReplyFuture(GcodeCommand.create("M584").confirmRegex("^Driver assignments:.*"));
+                        String axisConfig = waitForReply( M584reply );
+                        if (axisConfig != null) {
+                            setConfiguredAxes(axisConfig);
+                        }
+                    }
+                    else {
+                        setConfiguredAxes(null);
+                    }
+                }
+                catch (Exception e) {
+                    // ignore
+                }
+            }
+            setReportedAxes(reportedAxes);
+        }
+        org.pmw.tinylog.Logger.debug("=== End detecting firmware and position reporting.");
     }
     @Override
     public void home(Machine machine) throws Exception {
@@ -90,106 +113,407 @@ public class AltGCodeDriver extends GcodeDriver {
         Head head = machine.getDefaultHead();
         command = substituteVariable(command, "Id", head.getId());
         command = substituteVariable(command, "Name", head.getName());
+
         if (isUsingLetterVariables()) {
             AxesLocation axesHomeLocation =  new AxesLocation(machine,
                     CoordinateAxis::getHomeCoordinate);
-            Double feedrate = null;
-            Double acceleration = null;
-            Double jerk = null;
-            for (String variable : getAxisVariables((ReferenceMachine) machine)) {
-                ControllerAxis axis = axesHomeLocation.getAxisByVariable(this, variable);
-                if (axis != null) {
-                    double coordinate;
-                    if (axis.getType() == Axis.Type.Rotation) {
-                        // Never convert rotation to driver units.
-                        coordinate = axesHomeLocation.getCoordinate(axis);
-                    }
-                    else {
-                        coordinate = axesHomeLocation.getCoordinate(axis, getUnits());
-                    }
-                    command = substituteVariable(command, variable, coordinate);
-                    command = substituteVariable(command, variable+"L",
-                            axis.getLetter());
-
-                    // Because in homing we don't know which axis is moved when and in what combination,
-                    // we need to find the lowest rates of any axis.
-                    if (axis.getMotionLimit(1) != 0.0) {
-                        if (feedrate == null || feedrate > axis.getMotionLimit(1)) {
-                            feedrate = axis.getMotionLimit(1);
-                        }
-                    }
-                    if (axis.getMotionLimit(2) != 0.0) {
-                        if (acceleration == null || acceleration > axis.getMotionLimit(2)) {
-                            acceleration = axis.getMotionLimit(2);
-                        }
-                    }
-                    if (axis.getMotionLimit(3) != 0.0) {
-                        if (jerk == null || jerk > axis.getMotionLimit(3)) {
-                            jerk = axis.getMotionLimit(3);
-                        }
-                    }
-                }
-                else {
-                    command = substituteVariable(command, variable, null);
-                    command = substituteVariable(command, variable+"L", null);
-                }
-            }
-
-            if (getMotionControlType().isUnpredictable()) {
-                // Do not initialize rates, as the motion control is unpredictable, i.e. not controlled by us.
-                command = sendOnChangeSubstituteAllVariables(command, null, null, null);
-            }
-            else {
-                // For the purpose of homing, initialize the rates to the lowest of any axis.
-                command = sendOnChangeSubstituteAllVariables(command, feedrate, acceleration, jerk);
-            }
-        }
-        else {
+            command = alterFeedsAndSpeeds(command,axesHomeLocation,(ReferenceMachine) machine);
+        } else {
             // Do not initialize rates in legacy mode.
             command = sendOnChangeSubstituteAllVariables(command, null, null, null);
         }
 
-        var homeCmd = PendingCommand.create(command)
+        var homeCmd = GcodeCommand.create( command )
                 .timeout( -1 )
                 .confirmRegex( getCommand(null, CommandType.HOME_COMPLETE_REGEX) )
                 .onLastConfirmation(()->homeConfirmed(machine))
                 .onTimeOut(()->Logger.error("Timed out waiting for home to complete."));
         sendGcode(homeCmd);
     }
+    private String alterFeedsAndSpeeds(String command, AxesLocation axesHomeLocation, ReferenceMachine machine ) throws Exception {
+        Double feedrate = null;
+        Double acceleration = null;
+        Double jerk = null;
+
+        for (String variable : getAxisVariables(machine)) {
+            ControllerAxis axis = axesHomeLocation.getAxisByVariable(this, variable);
+            if (axis == null) {
+                command = substituteVariable(command, variable, null);
+                command = substituteVariable(command, variable + "L", null);
+                continue;
+            }
+
+            double coordinate;
+            if (axis.getType() == Axis.Type.Rotation) {
+                // Never convert rotation to driver units.
+                coordinate = axesHomeLocation.getCoordinate(axis);
+            }else {
+                coordinate = axesHomeLocation.getCoordinate(axis, getUnits());
+            }
+            command = substituteVariable(command, variable, coordinate);
+            command = substituteVariable(command, variable+"L",axis.getLetter());
+
+            // Because in homing we don't know which axis is moved when and in what combination,
+            // we need to find the lowest rates of any axis.
+            if (axis.getMotionLimit(1) != 0.0) {
+                if (feedrate == null || feedrate > axis.getMotionLimit(1)) {
+                    feedrate = axis.getMotionLimit(1);
+                }
+            }
+            if (axis.getMotionLimit(2) != 0.0) {
+                if (acceleration == null || acceleration > axis.getMotionLimit(2)) {
+                    acceleration = axis.getMotionLimit(2);
+                }
+            }
+            if (axis.getMotionLimit(3) != 0.0) {
+                if (jerk == null || jerk > axis.getMotionLimit(3)) {
+                    jerk = axis.getMotionLimit(3);
+                }
+            }
+        }
+        // Do not initialize rates, if the motion control is unpredictable, i.e. not controlled by us.
+        if (getMotionControlType().isUnpredictable()) {
+            return sendOnChangeSubstituteAllVariables(command, null, null, null);
+        }
+        // For the purpose of homing, initialize the rates to the lowest of any axis.
+        return sendOnChangeSubstituteAllVariables(command, feedrate, acceleration, jerk);
+    }
+
+    /**
+     * Presumably connects?
+     * @throws Exception
+     */
+    public synchronized void connect() throws Exception {
+        disconnectRequested = false;
+        getCommunications().setDriverName(getName());
+        org.pmw.tinylog.Logger.debug("[{}] Connect", getCommunications().getConnectionName());
+        getCommunications().connect();
+
+        if( getCommunications() instanceof SerialPortCommunications comms)
+            gcodeWriter = new GcodeWriter(rules,comms.getBaseStream());
+        connected = false;
+
+        startResponseHandler();
+
+        // Wait a bit while the controller starts up
+        /* TODO
+            This doesn't actually check anything so rather pointless.
+            Instead it's better to just send the command and use the states of the driver to determine
+            If there's actually a connecting to a proper controller UNINIT->INIT->IDLE
+            Use the confirmation of the connect command to set connected etc instead of assuming 'all is well'
+         */
+        org.pmw.tinylog.Logger.trace(getName()+" waiting for connection "+connectWaitTimeMilliseconds+"ms");
+        Thread.sleep(connectWaitTimeMilliseconds);
+        // TODO Nothing is checked ??
+        // Consuming any startup/unsolicited messages is done by default
+
+        // Disable the driver
+        setEnabled(false);  // TODO this can call the super directly given it's during connect
+
+        // Send startup Gcode
+        var connect = getCommand(null, CommandType.CONNECT_COMMAND);
+        var cmd = GcodeCommand.create(connect);
+        sendGcode( cmd );   // TODO Nothing is done with the reply??
+
+        connected = true;
+
+        // reset send-on-change behavior
+        sendOnChangeResetAll();
+    }
+    @Override
+    public void setEnabled(boolean enabled) throws Exception {
+        if (enabled && !connected) {
+            connect();
+        }
+        if (connected) {
+            if (enabled) {
+                sendGcode( GcodeCommand.create( getCommand(null, CommandType.ENABLE_COMMAND)) );
+            }
+            else {
+                try {
+                    sendGcode( GcodeCommand.create(getCommand(null, CommandType.DISABLE_COMMAND)) );
+                    gcodeWriter.drainCommandQueue(getTimeoutAtMachineSpeed());
+                    /* TODO figure out what the intention is
+                        The disable command should probably be understood by the writer to cease all activity
+                        Then the confirmation of that, can be the trigger to disconnect?
+                     */
+
+                }
+                catch (Exception e) {
+                    // When the connection is lost, we have IO errors. We should still be able to go on
+                    // disabling the machine.
+                    org.pmw.tinylog.Logger.warn(e);
+                }
+                if (isInSimulationMode() || !connectionKeepAlive) {
+                    disconnect();
+                }
+            }
+        }
+        super.setEnabled(enabled);
+    }
+    @Override
+    public boolean delay(int milliseconds) throws Exception {
+        String command = getCommand(null, CommandType.DELAY_COMMAND);
+        if (command == null || command.isEmpty()) {
+            org.pmw.tinylog.Logger.trace("delaying in gcode driver is not supported");
+            return false;
+        }
+        if (milliseconds < 1) {
+            org.pmw.tinylog.Logger.trace("gcode delay not sent for zero duration");
+            return true;
+        }
+
+        command = substituteVariable(command, "TimeMS", milliseconds);
+        command = substituteVariable(command, "TimeSeconds", (double)milliseconds / 1000.0);
+        sendGcode( GcodeCommand.create(command) );
+
+        // consider this delay a pending motion for subsequent WaitForCompletion to actually
+        // wait which might otherwise be optimized away.
+        // motionpending=true; TODO removed this flag given it's handled by queue state
+        org.pmw.tinylog.Logger.trace("gcode delay sent");
+        return true;
+    }
+    @Override
+    public void setGlobalOffsets(Machine machine, AxesLocation axesLocation)
+            throws Exception {
+        // Compose the command
+        String command = getCommand(null, CommandType.SET_GLOBAL_OFFSETS_COMMAND);
+        // If not a valid command, try the legacy POST_VISION_HOME_COMMAND
+        if( command==null){
+            doLegacyPostVisionHome(axesLocation);
+            return;
+        }
+
+        // legacy head support
+        Head head = machine.getDefaultHead();
+        command = substituteVariable(command, "Id", head.getId());
+        command = substituteVariable(command, "Name", head.getName());
+
+        boolean isEmpty = true;
+        for (String variable : getAxisVariables((ReferenceMachine) machine)) {
+            ControllerAxis axis = axesLocation.getAxisByVariable(this, variable);
+            if (axis != null) {
+                if (hasVariable(command, variable)) {
+                    double coordinate;
+                    if (axis.getType() == Axis.Type.Rotation) {
+                        // Never convert rotation to driver units.
+                        coordinate = axesLocation.getCoordinate(axis);
+                    }
+                    else {
+                        coordinate = axesLocation.getCoordinate(axis, getUnits());
+                    }
+                    command = substituteVariable(command, variable, coordinate);
+                    command = substituteVariable(command, variable+"L",
+                            axis.getLetter());
+                    // Store the new driver coordinate on the axis.
+                    axis.setDriverCoordinate(coordinate);
+                    isEmpty = false;
+                }
+                else {
+                    // It is imperative that the axis global offset is really set. Otherwise all bets
+                    // are off and collisions in subsequent moves are very likely.
+                    throw new Exception("Axis variable "+variable+" is missing in SET_GLOBAL_OFFSETS_COMMAND.");
+                }
+            }
+            else {
+                command = substituteVariable(command, variable, null);
+                command = substituteVariable(command, variable+"L", null);
+            }
+        }
+        if (!isEmpty) {
+            // If no axes are included, the G92 command must not be executed, because it would otherwise reset all
+            // axes to zero in some controllers!
+            sendGcode( GcodeCommand.create(command).timeout(-1) ); // -1 is also default, but just in case
+        }
+    }
+    private void doLegacyPostVisionHome( AxesLocation axesLocation) throws Exception {
+        String postVisionHomeCommand = getCommand(null, CommandType.POST_VISION_HOME_COMMAND);
+        ControllerAxis axisX = axesLocation.getAxisByVariable(this, "X");
+        ControllerAxis axisY = axesLocation.getAxisByVariable(this, "Y");
+
+        if (postVisionHomeCommand == null || axisX == null  || axisY == null) {
+            return;
+        }
+        // X, Y, are mapped to this driver, legacy support enabled
+        postVisionHomeCommand = substituteVariable(postVisionHomeCommand, "X",
+                axesLocation.getCoordinate(axisX, getUnits()));
+        postVisionHomeCommand = substituteVariable(postVisionHomeCommand, "Y",
+                axesLocation.getCoordinate(axisY, getUnits()));
+        // Execute the command
+        sendGcode( GcodeCommand.create(postVisionHomeCommand)
+                .timeout(-1)
+                .onLastConfirmation(()->alterHomeCoords(axesLocation) ) );
+    }
+    protected void alterHomeCoords( AxesLocation axesLocation ) {
+        try {
+            ControllerAxis axisX = axesLocation.getAxisByVariable(this, "X");
+            ControllerAxis axisY = axesLocation.getAxisByVariable(this, "Y");
+
+            // Store the new current coordinate on the axis.
+            axisX.setDriverCoordinate(axesLocation.getCoordinate(axisX, getUnits()));
+            axisY.setDriverCoordinate(axesLocation.getCoordinate(axisY, getUnits()));
+        }catch (Exception ignored) {
+            // This can be ignored because the method is only reached after a command was issued that already
+            // checked this
+        }
+    }
+    @Override
+    public AxesLocation getReportedLocation(long timeout) throws Exception {
+        String command = getCommand(null, CommandType.GET_POSITION_COMMAND);
+        if (command == null) {
+            throw new Exception(getName()+" configuration error: missing GET_POSITION_COMMAND.");
+        }
+        var regex = getCommand(null, CommandType.POSITION_REPORT_REGEX);
+        if( regex == null) {
+            throw new Exception(getName()+" configuration error: missing POSITION_REPORT_REGEX.");
+        }
+
+        // True queued reporting
+        var cmd = GcodeCommand.create(command).timeout(-1)
+                        .markLocationRequest()
+                        .confirmRegex(regex);
+        sendGcode( cmd );
+
+        // This part can stay because the earlier markLocationRequest makes sure it ends up in this queue
+        AxesLocation lastReportedLocation = reportedLocationsQueue.poll(timeout, TimeUnit.MILLISECONDS);
+        if (lastReportedLocation != null) {
+            org.pmw.tinylog.Logger.trace("{} got lastReportedLocation {}", getName(), lastReportedLocation);
+            return lastReportedLocation;
+        }
+        // Timeout expired.
+        throw new Exception(getName()+" timeout waiting for response to " + command);
+    }
+    @Override
+    public void actuate(Actuator actuator, boolean on) throws Exception {
+        String command = getCommand(actuator, CommandType.ACTUATE_BOOLEAN_COMMAND);
+        // This substitution must come first, as it may contain nested and escaped {variables}.
+        command = substituteVariable(command, "True", on ? on : null);
+        command = substituteVariable(command, "False", on ? null : on);
+
+        command = substituteVariable(command, "Id", actuator.getId());
+        command = substituteVariable(command, "Name", actuator.getName());
+        if (actuator instanceof ReferenceActuator) {
+            command = substituteVariable(command, "Index", ((ReferenceActuator)actuator).getIndex());
+        }
+        command = substituteVariable(command, "BooleanValue", on);
+        sendGcode( GcodeCommand.create(command).onLastConfirmation(()->simulateActuate(actuator,on)));
+    }
+    private void simulateActuate(Actuator actuator, Object value) {
+        try {
+            SimulationModeMachine.simulateActuate(actuator, value, true);
+        }catch (Exception ignored) {
+            // TODO raise this somewhere
+        }
+    }
+    @Override
+    public void actuate(Actuator actuator, double value) throws Exception {
+        String command = getCommand(actuator, CommandType.ACTUATE_DOUBLE_COMMAND);
+        command = substituteVariable(command, "Id", actuator.getId());
+        command = substituteVariable(command, "Name", actuator.getName());
+        if (actuator instanceof ReferenceActuator) {
+            command = substituteVariable(command, "Index", ((ReferenceActuator)actuator).getIndex());
+        }
+        command = substituteVariable(command, "DoubleValue", value);
+        command = substituteVariable(command, "IntegerValue", (int) value);
+        sendGcode( GcodeCommand.create(command).onLastConfirmation(()->simulateActuate(actuator,value)));
+    }
+    @Override
+    public String actuatorRead(Actuator actuator, Object parameter) throws Exception {
+        /*
+         * The logic here is a little complicated. This is the only driver method that is
+         * not fire and forget. In this case, we need to know if the command was serviced or not
+         * and throw an Exception if not.
+         */
+        String command = getCommand(actuator, CommandType.ACTUATOR_READ_COMMAND);
+        String regex = getCommand(actuator, CommandType.ACTUATOR_READ_REGEX);
+        if( regex == null || command == null ) {
+            throw new Exception(String.format("Actuator \"%s\" read error: Driver configuration is missing ACTUATOR_READ_COMMAND or ACTUATOR_READ_REGEX.", actuator.getName()));
+        }
+        command = substituteVariable(command, "Id", actuator.getId());
+        command = substituteVariable(command, "Name", actuator.getName());
+        if (actuator instanceof ReferenceActuator) {
+            command = substituteVariable(command, "Index", ((ReferenceActuator)actuator).getIndex());
+        }
+        if (parameter != null) {
+            if (parameter instanceof Double) { // Backwards compatibility
+                Double doubleParameter = (Double) parameter;
+                command = substituteVariable(command, "DoubleValue", doubleParameter);
+                command = substituteVariable(command, "IntegerValue", (int) doubleParameter.doubleValue());
+            }
+
+            command = substituteVariable(command, "Value", parameter);
+        }
+
+        var cmd = GcodeCommand.create(command)
+                    .confirmRegex(regex)
+                    .timeout(timeoutMilliseconds)
+                    .onTimeOut(()->Logger.error(String.format("Actuator \"%s\" read error: No matching responses found.", actuator.getName())));
+        var waitForValidReply = cmd.createReplyFuture();
+        sendGcode(cmd);
+
+        try {
+            var reply = waitForValidReply.get((long)timeoutMilliseconds, TimeUnit.MILLISECONDS);
+            org.pmw.tinylog.Logger.trace("actuatorRead response: {}", reply );
+
+            Pattern pattern = Pattern.compile(regex);
+            Matcher matcher = pattern.matcher(reply);
+            try {
+                matcher.matches(); // Was checked somewhere else, but needed for .group to work
+                return matcher.group("Value");
+            }
+            catch (IllegalArgumentException e) {
+                throw new Exception(String.format("Actuator \"%s\" read error: Regex is missing \"Value\" capturing group. See https://github.com/openpnp/openpnp/wiki/GcodeDriver#actuator_read_regex",
+                        actuator.getName()), e);
+            }
+            catch (Exception e) {
+                throw new Exception(String.format("Actuator \"%s\" read error: Failed to parse response. See https://github.com/openpnp/openpnp/wiki/GcodeDriver#actuator_read_regex",
+                        actuator.getName()), e);
+            }
+        } catch (TimeoutException e) {
+            throw new Exception("Timeout waiting for actuator read response");
+        }
+    }
     protected class ResponseThread extends Thread {
         @Override
         public void run() {
             while(checkResponses){
-                GcodeSerialWriter.CommandResponse response = null;
+                GcodeCommand cmd;
                 try {
                     // Timeout so we can shut this down cleanly with checkResponses
-                    response = gcodeWriter.getResponseQueue().poll(1, TimeUnit.SECONDS);
-                    if( response == null )
+                    cmd = gcodeWriter.getResultsQueue().poll(1, TimeUnit.SECONDS);
+                    if( cmd == null ) {
                         continue;
-                    var ori = response.original();
-                    switch(response.result()){
-                        case FAILED -> {
-                            org.pmw.tinylog.Logger.error( "{} failed to write command {}", gcodeWriter.id(), ori.command());
+                    }
+                    switch(cmd.state()){
+                        case FAILED_SEND:
+                            org.pmw.tinylog.Logger.error( "{} failed to write command {}", gcodeWriter.id(), cmd.command());
                             disconnect();
                             try {
                                 Configuration.get().getMachine().setEnabled(false);
                             } catch (Exception e) {
                                 throw new RuntimeException(e);
                             }
-                        }
-                        case CONFIRMED -> {
-                            // Nothing to do?
-                            ori.doConfirmation();
-                        }
-                        case ERROR -> {
-                            org.pmw.tinylog.Logger.error("{} error response from controller: {}", response.response(), gcodeWriter.id());
-                        }
-                        case TIMEOUT -> {
-                            org.pmw.tinylog.Logger.error("Timeout from controller when sending: {}", ori.command());
-                            ori.doTimeOut();
-                        }
-                        case MAYBE_LOCATION -> processPositionReport(new Line(response.response()));
-                    }
+                        break;
+                        case CONFIRMED :
+                            if( cmd.isLocationReply() ){
+                                processPositionReport( new Line(cmd.reply()) );
+                            }else if( cmd.hasFuture() ){
+                                cmd.completeFuture();
+                            }
+                            cmd.doConfirmation();
+                            break;
+                        case ERROR :
+                            org.pmw.tinylog.Logger.error("{} error response from controller: {}", cmd.reply(), gcodeWriter.id());
+                            break;
+                        case TIMEOUT :
+                            org.pmw.tinylog.Logger.error("Timeout from controller when sending: {}", cmd.command());
+                            cmd.doTimeOut();
+                        break;
+                        case MAYBE_LOCATION:
+                            processPositionReport(new Line(cmd.reply()));
+                            break;
+                        case UNSOLICITED:break;
+                    };
                 } catch (InterruptedException ignored) {
 
                 }

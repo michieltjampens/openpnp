@@ -58,11 +58,7 @@ import org.openpnp.machine.reference.camera.OpenPnpCaptureCamera;
 import org.openpnp.machine.reference.camera.SimulatedUpCamera;
 import org.openpnp.machine.reference.camera.SwitcherCamera;
 import org.openpnp.machine.reference.camera.Webcams;
-import org.openpnp.machine.reference.driver.GcodeAsyncDriver;
-import org.openpnp.machine.reference.driver.GcodeDriver;
-import org.openpnp.machine.reference.driver.NullDriver;
-import org.openpnp.machine.reference.driver.NullMotionPlanner;
-import org.openpnp.machine.reference.driver.ReferenceAdvancedMotionPlanner;
+import org.openpnp.machine.reference.driver.*;
 import org.openpnp.machine.reference.feeder.AdvancedLoosePartFeeder;
 import org.openpnp.machine.reference.feeder.BlindsFeeder;
 import org.openpnp.machine.reference.feeder.ReferenceAutoFeeder;
@@ -508,6 +504,7 @@ public class ReferenceMachine extends AbstractMachine {
         l.add(GcodeDriver.class);
         l.add(GcodeAsyncDriver.class);
         l.add(NeoDen4Driver.class);
+        l.add(AltGCodeDriver.class);
         return l;
     }
 
