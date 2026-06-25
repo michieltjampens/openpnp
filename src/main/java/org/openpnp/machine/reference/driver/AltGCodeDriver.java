@@ -86,8 +86,8 @@ public class AltGCodeDriver extends GcodeDriver {
             if (firmware != null) {
                 try {
                     if (getFirmwareProperty("FIRMWARE_NAME", "").contains("Duet")) {
-                        var M584reply = sendGcodeGetReplyFuture(GcodeCommand.create("M584").confirmRegex("^Driver assignments:.*"));
-                        String axisConfig = waitForReply( M584reply );
+                        var driverReply = sendGcodeGetReplyFuture(GcodeCommand.create("M584").confirmRegex("^Driver assignments:.*"));
+                        String axisConfig = waitForReply( driverReply );
                         if (axisConfig != null) {
                             setConfiguredAxes(axisConfig);
                         }
@@ -189,8 +189,10 @@ public class AltGCodeDriver extends GcodeDriver {
         org.pmw.tinylog.Logger.debug("[{}] Connect", getCommunications().getConnectionName());
         getCommunications().connect();
 
-        if( getCommunications() instanceof SerialPortCommunications comms)
-            gcodeWriter = new GcodeWriter(rules,comms.getBaseStream());
+        if( getCommunications() instanceof SerialPortCommunications) {
+            var comms = (SerialPortCommunications)getCommunications();
+            gcodeWriter = new GcodeWriter(rules, comms.getBaseStream());
+        }
         connected = false;
 
         startResponseHandler();
