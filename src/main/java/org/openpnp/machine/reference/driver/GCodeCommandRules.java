@@ -40,11 +40,18 @@ public class GCodeCommandRules {
     public void disableLogging() {
         this.isLogging=false;
     }
+    public void setLogging( boolean logging ){
+        this.isLogging=logging;
+    }
     public boolean needsCleaning(){
         return removeComments||compressGcode;
     }
     public boolean doCompress(){
         return compressGcode;
+    }
+    public void setCleaning( boolean compress, boolean removeComments){
+        this.compressGcode=compress;
+        this.removeComments=removeComments;
     }
     public boolean removeComments(){
         return removeComments;

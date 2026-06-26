@@ -6,6 +6,7 @@ import org.tinylog.Logger;
 
 import java.util.Arrays;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class GcodeWriter implements Writable {
 
@@ -15,11 +16,11 @@ public class GcodeWriter implements Writable {
     private final BaseStream controller;
     private Writable writer;
 
-    public enum STREAM_STATE{IDLE,SEND_ERROR,QUEUE_ERROR,TIMEOUT, SEND_OK,WAITING};
+    public enum STREAM_STATE{IDLE,SEND_REQUEST,SEND_ERROR,QUEUE_ERROR,TIMEOUT, SEND_OK,WAITING};
 
     private final GCodeCommandRules rules;
 
-    private STREAM_STATE state = STREAM_STATE.IDLE;
+    private volatile AtomicReference<STREAM_STATE> state = new AtomicReference<>(STREAM_STATE.IDLE);
 
     private final ScheduledExecutorService timedExecutor = Executors.newScheduledThreadPool(1);
     private ScheduledFuture<?> timeoutFuture;
@@ -71,38 +72,63 @@ public class GcodeWriter implements Writable {
         }
         return true;
     }
-    public boolean nothingPending() {
-        return pendingCommands.isEmpty()&&responseQueue.isEmpty();
-    }
     public boolean inErrorState(){
-        return state == STREAM_STATE.SEND_ERROR || state == STREAM_STATE.QUEUE_ERROR;
+        return state.get() == STREAM_STATE.SEND_ERROR || state.get() == STREAM_STATE.QUEUE_ERROR;
     }
     public STREAM_STATE addGcodeCommand( GcodeCommand cmd ){
         pendingCommands.offer( cmd );
-        if( pendingCommands.size()==1)
+        if( pendingCommands.size()==1) {
+            System.out.println(cmd.command()+" -> Nothing else in queue, send directly");
             return sendCommand();
-        return state;
+        }
+        return state.get();
     }
     private synchronized STREAM_STATE sendCommand(){
+
+        if( !state.compareAndSet(STREAM_STATE.IDLE, STREAM_STATE.SEND_REQUEST)) {
+            System.out.println("-1 Wrong state:"+state );
+            return state.get();
+        }
         if (pendingCommands.isEmpty()) {
-            return STREAM_STATE.QUEUE_ERROR;
+            System.err.println("-2 Queue error");
+            state.compareAndSet(STREAM_STATE.IDLE, STREAM_STATE.QUEUE_ERROR);
+            return state.get();
         }
-        if( state != STREAM_STATE.IDLE) { // Which means waiting also causes this
-            return state;
-        }
+        //System.out.println("0 Pending before transmission: "+pendingCommands.size());
         var cmd = pendingCommands.getFirst();
-        System.out.println("Sending:"+cmd.command());
-        if( writer.writeLine(id(),cmd.command()) ) {
-            cmd.markSendOk();
-            timeoutFuture = timedExecutor.schedule(this::timeoutOccurred, cmd.timeout(), TimeUnit.MILLISECONDS);
-            state = STREAM_STATE.SEND_OK;
+        //System.out.println("1 Sending:"+cmd.command()+" while state:"+state.get());
+        cmd.markUnderway();
+        if( writer.writeLine(id(),cmd.command()) ) { // No idea how long this takes
+            if( cmd.markSendOk() ) {
+                if (state.compareAndSet(STREAM_STATE.SEND_REQUEST, STREAM_STATE.SEND_OK)) {
+                    if( timeoutFuture != null )
+                        timeoutFuture.cancel(true);
+                    timeoutFuture = timedExecutor.schedule(this::timeoutOccurred, cmd.timeout(), TimeUnit.MILLISECONDS);
+                } else {
+                    System.out.println("2b Transmission already handled: " + state.get());
+                }
+            }else{
+                // Reply already raced ahead and resolved the command before we could mark SEND_OK.
+                // The transaction is over; settle the stream state to match reality.
+                //System.out.println("2e Command already resolved (" + cmd.state() + ") before send_ok — settling stream state");
+                if (state.compareAndSet(STREAM_STATE.SEND_REQUEST, STREAM_STATE.IDLE)) {
+                    if (!pendingCommands.isEmpty()) {
+                        sendCommand();
+                    }
+                }
+            }
         }else {
             cmd.markFailedToSend();
             pendingCommands.clear();    // Failed to send and no retry mechanism yet, so clear queue
-            state = STREAM_STATE.SEND_ERROR;
-            responseQueue.add( cmd );
+            if( state.compareAndSet(STREAM_STATE.SEND_REQUEST, STREAM_STATE.SEND_ERROR) ) {
+                System.out.println("2c State changed to send_error");
+                responseQueue.add(cmd);
+            }else{
+                System.err.println("2d State isn't SEND_REQUEST but "+state.get());
+            }
         }
-        return state;
+        //System.out.println("3 Finished send command for "+cmd.command()+" , pending: "+pendingCommands.size());
+        return state.get();
     }
 
     public BlockingQueue<GcodeCommand> getResultsQueue() {
@@ -110,25 +136,39 @@ public class GcodeWriter implements Writable {
     }
 
     private void stopWaiting(){
-        if( state!= STREAM_STATE.WAITING) {
+        if( state.get() != STREAM_STATE.WAITING) {
+            System.err.println("Somehow reached this while not waiting...? "+state.get());
             return;
         }
-        state = STREAM_STATE.IDLE;
-        sendCommand();
+        if( state.compareAndSet(STREAM_STATE.WAITING, STREAM_STATE.IDLE) ) {
+            System.out.println("Finished waiting, back to idle");
+            sendCommand();
+        }else{
+            System.err.println("Somehow state change since if? "+state.get());
+        }
     }
 
     public void timeoutOccurred(){
-        state = STREAM_STATE.TIMEOUT; // Change state to indicate an error occurred
-        var item = pendingCommands.removeFirst(); // Grab the first element to fill in  the response queue
-        item.markTimedOut();
-        responseQueue.add( item );
-        pendingCommands.clear(); // For now no retry logic is implemented
+
+        STREAM_STATE previous = state.getAndSet(STREAM_STATE.TIMEOUT); // or TIMEOUT, if you track it separately
+        if (previous == STREAM_STATE.SEND_OK || previous == STREAM_STATE.SEND_REQUEST) {
+            // legit timeout — command never got its reply in time
+            var item = pendingCommands.removeFirst(); // Grab the first element to fill in  the response queue
+            item.markTimedOut();
+            responseQueue.add( item );
+            pendingCommands.clear(); // For now no retry logic is implemented
+        } else if (previous == STREAM_STATE.IDLE) {
+            // reply already arrived and transitioned us to IDLE before the timeout fired —
+            // this timeout is stale/spurious, the future should've been cancelled but wasn't
+            System.out.println("Stale timeout fired, already IDLE — ignoring");
+            // don't double-complete cmd, don't fire callbacks for a finished command
+        }
     }
 
     /* ***** Writable  **** */
     @Override
     public boolean writeLine(String origin, String msg) {
-        System.out.println("Received:"+msg);
+       // System.out.println("Received:"+msg);
         msg=msg.trim();
         // Anything received is assumed to be a reply to what was last send
         // Do this first just to be sure it won't trigger during processing
@@ -143,23 +183,32 @@ public class GcodeWriter implements Writable {
         var item = pendingCommands.getFirst(); // Peeks at the top, doesn't remove it yet
         item.markReplied(msg);
         if( item.command().startsWith("$") ){
-            state = STREAM_STATE.WAITING;
-            timedExecutor.schedule(this::stopWaiting,rules.getDollarWaitTimeMilliseconds(),TimeUnit.MILLISECONDS);
+            if( state.compareAndSet(STREAM_STATE.SEND_OK, STREAM_STATE.WAITING) ) {
+                timedExecutor.schedule(this::stopWaiting, rules.getDollarWaitTimeMilliseconds(), TimeUnit.MILLISECONDS);
+            }else{
+                System.out.println("Tried to wait, but state was wrong: "+state.get());
+            }
         }
         if( !rules.isErrorMessage(msg) ){ // Or try again logic?
             pendingCommands.removeFirst();
             if( item.isConfirmed() ) {
-                System.out.println("confirmed:"+item.command());
+               // System.out.println("confirmed:"+item.command()+" with "+item.reply());
                 org.pmw.tinylog.Logger.trace("[{}] confirmed {}", id(), item.command());
             }else{
                 System.out.println("NOT confirmed:"+item.command());
             }
-            state = STREAM_STATE.IDLE;
-            if( !pendingCommands.isEmpty() ){
-                sendCommand();
+            if( state.compareAndSet(STREAM_STATE.SEND_OK, STREAM_STATE.IDLE) ) {
+                //System.out.println("Back to idle");
+                if (!pendingCommands.isEmpty()) {
+                   // System.out.println("More work to do!");
+                    sendCommand();
+                }else{
+                    System.out.println( item.command() +" -> Was last in queue, going idle");
+                    System.out.println( "----------------------------------------------");
+                }
+            }else{
+                System.out.println(item.command()+ " -> Not back to idle because: "+state.get());
             }
-
-
         }else{
             // TODO Try again or give up or flush queue? For now copy original and just give up
             item.markError();

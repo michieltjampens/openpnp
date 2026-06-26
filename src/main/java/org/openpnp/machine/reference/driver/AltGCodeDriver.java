@@ -205,6 +205,8 @@ public class AltGCodeDriver extends GcodeDriver {
 
         if( getCommunications() instanceof SerialPortCommunications) {
             var comms = (SerialPortCommunications)getCommunications();
+            rules.setCleaning(compressGcode,removeComments);
+            rules.setLogging( loggingGcode );
             gcodeWriter = new GcodeWriter(rules, comms.getBaseStream());
         }
         connected = false;
@@ -532,7 +534,7 @@ public class AltGCodeDriver extends GcodeDriver {
                             if( cmd.isConfirmed())
                                 cmd.doConfirmation();
                             break;
-                        case ERROR :
+                        case ERROR_REPLY:
                             org.pmw.tinylog.Logger.error("{} error response from controller: {}", cmd.reply(), gcodeWriter.id());
                             break;
                         case TIMEOUT :
