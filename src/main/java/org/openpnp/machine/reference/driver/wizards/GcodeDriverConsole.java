@@ -21,6 +21,8 @@ import org.openpnp.Translations;
 import org.openpnp.gui.support.AbstractConfigurationWizard;
 import org.openpnp.gui.support.DoubleConverter;
 import org.openpnp.gui.support.IntegerConverter;
+import org.openpnp.machine.reference.driver.AltGCodeDriver;
+import org.openpnp.machine.reference.driver.GcodeCommand;
 import org.openpnp.machine.reference.driver.GcodeDriver;
 import org.openpnp.machine.reference.driver.GcodeDriver.CommandType;
 import org.openpnp.model.Configuration;
@@ -180,16 +182,32 @@ public class GcodeDriverConsole extends AbstractConfigurationWizard {
         try {
             // Print any responses in the console that may have accumulated in the mean-time.
             for (GcodeDriver.Line line : driver.receiveResponses()) {
-                textAreaConsole.append(line.getLine() + "\n");
+                textAreaConsole.append(driver.getName()+">"+ line.getLine() + "\n");
             }
-            // Send the command.
-            driver.sendCommand(cmd, 5000);
+            // Send the command.c
             // display the command in the console
-            textAreaConsole.append("> " + cmd + "\n");
-            for (GcodeDriver.Line line : driver.receiveResponses(driver.getCommand(null, CommandType.COMMAND_CONFIRM_REGEX), driver.getTimeoutMilliseconds(), 
-                    (r) -> { return r; })) {
-                textAreaConsole.append(line.getLine() + "\n");
+            textAreaConsole.append("user>" + cmd + "\n");
+            if( driver instanceof AltGCodeDriver alt ){
+                var gcode = GcodeCommand.create(cmd).timeout(5000)
+                        .confirmRegex(driver.getCommand(null, CommandType.COMMAND_CONFIRM_REGEX));
+                var future = alt.sendGcodeGetReplyFuture(gcode);
+                var reply = AltGCodeDriver.waitForReply(future,driver.getTimeoutMilliseconds() );
+                if( reply == null) {
+                    textAreaConsole.append(alt.getName()+">Timeout\n");
+                }else{
+                    for (GcodeDriver.Line line : driver.receiveResponses()) {
+                        textAreaConsole.append(driver.getName()+">"+ line.getLine() + "\n");
+                    }
+                }
+            }else{
+                driver.sendCommand(cmd, 5000);
+                for (GcodeDriver.Line line : driver.receiveResponses(driver.getCommand(null, CommandType.COMMAND_CONFIRM_REGEX), driver.getTimeoutMilliseconds(),
+                        (r) -> { return r; })) {
+                    textAreaConsole.append(driver.getName()+">"+line.getLine() + "\n");
+                }
             }
+
+
         }
         catch (Exception ex) {
             Logger.debug("Gcode console error: " + ex);

@@ -8,6 +8,8 @@ import org.openpnp.model.Configuration;
 import org.openpnp.spi.*;
 import org.tinylog.Logger;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -21,6 +23,7 @@ public class AltGCodeDriver extends GcodeDriver {
     GCodeCommandRules rules = new GCodeCommandRules();
     boolean checkResponses =true;
     ResponseThread responseThread;
+    List<Line> responses = new ArrayList<>();
 
     public void startResponseHandler(){
         responseThread = new ResponseThread();
@@ -50,7 +53,7 @@ public class AltGCodeDriver extends GcodeDriver {
         }
         gcodeWriter.sendGcode( gCode );
     }
-    protected CompletableFuture<String> sendGcodeGetReplyFuture( GcodeCommand gCode){
+    public CompletableFuture<String> sendGcodeGetReplyFuture( GcodeCommand gCode){
         gCode.createReplyFuture();
         sendGcode(gCode);
         return gCode.replyFuture();
@@ -64,9 +67,18 @@ public class AltGCodeDriver extends GcodeDriver {
             rules.setErrorCommandRegex(text);
         }
     }
+
     private String waitForReply(CompletableFuture<String> future ) {
         try {
             return future.get(timeoutMilliseconds, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException | InterruptedException | ExecutionException e) {
+            Logger.error("Timeout while waiting for firmware report");
+        }
+        return null;
+    }
+    public static String waitForReply(CompletableFuture<String> future, long timeout ) {
+        try {
+            return future.get(timeout, TimeUnit.MILLISECONDS);
         } catch (TimeoutException | InterruptedException | ExecutionException e) {
             Logger.error("Timeout while waiting for firmware report");
         }
@@ -255,6 +267,14 @@ public class AltGCodeDriver extends GcodeDriver {
         }
         super.setEnabled(enabled);
     }
+    public List<Line> receiveResponses() throws Exception {
+    //    bailOnError();
+        List<Line> responses = new ArrayList<>();
+        // Read any responses that might be queued up.
+        responseQueue.drainTo(responses);
+        return responses;
+    }
+
     @Override
     public boolean delay(int milliseconds) throws Exception {
         String command = getCommand(null, CommandType.DELAY_COMMAND);
@@ -488,6 +508,11 @@ public class AltGCodeDriver extends GcodeDriver {
                     if( cmd == null ) {
                         continue;
                     }
+                    if( responseQueue.size()>5){
+                        responseQueue.take();
+                    }
+                    responseQueue.put(new Line(cmd.reply()));
+
                     switch(cmd.state()){
                         case FAILED_SEND:
                             org.pmw.tinylog.Logger.error( "{} failed to write command {}", gcodeWriter.id(), cmd.command());
