@@ -43,6 +43,8 @@ public class AltGCodeDriver extends GcodeDriver {
             Logger.error("No valid gcode writer available");
             return;
         }
+        if( gCode.isInvalid())
+            return;
         if ( gCode.timeout() == -1) {
             gCode.timeout( infinityTimeoutMilliseconds);
         }

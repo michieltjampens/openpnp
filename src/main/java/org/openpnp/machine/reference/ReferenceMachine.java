@@ -250,7 +250,9 @@ public class ReferenceMachine extends AbstractMachine {
                         Logger.warn(e1);
                     }
                 }
-                fireMachineEnableFailed(e.getMessage());
+                var fail = getDrivers().get( enabledDrivers.size() );
+                var message = String.format("Failed to enable %s: %s",fail.getId(),e.getMessage());
+                fireMachineEnableFailed(message);
                 throw e;
             }
             fireMachineEnabled();

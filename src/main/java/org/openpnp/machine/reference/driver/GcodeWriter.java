@@ -79,9 +79,11 @@ public class GcodeWriter implements Writable {
     }
     public STREAM_STATE addGcodeCommand( GcodeCommand cmd ){
         pendingCommands.offer( cmd );
-        return sendCommand();
+        if( pendingCommands.size()==1)
+            return sendCommand();
+        return state;
     }
-    private STREAM_STATE sendCommand(){
+    private synchronized STREAM_STATE sendCommand(){
         if (pendingCommands.isEmpty()) {
             return STREAM_STATE.QUEUE_ERROR;
         }
@@ -127,6 +129,7 @@ public class GcodeWriter implements Writable {
     @Override
     public boolean writeLine(String origin, String msg) {
         System.out.println("Received:"+msg);
+        msg=msg.trim();
         // Anything received is assumed to be a reply to what was last send
         // Do this first just to be sure it won't trigger during processing
         if( timeoutFuture != null ) {
@@ -151,11 +154,12 @@ public class GcodeWriter implements Writable {
             }else{
                 System.out.println("NOT confirmed:"+item.command());
             }
+            state = STREAM_STATE.IDLE;
             if( !pendingCommands.isEmpty() ){
                 sendCommand();
-            }else if( state == STREAM_STATE.SEND_OK){
-                state= STREAM_STATE.IDLE;
             }
+
+
         }else{
             // TODO Try again or give up or flush queue? For now copy original and just give up
             item.markError();
