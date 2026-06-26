@@ -187,7 +187,8 @@ public class GcodeDriverConsole extends AbstractConfigurationWizard {
             // Send the command.c
             // display the command in the console
             textAreaConsole.append("user>" + cmd + "\n");
-            if( driver instanceof AltGCodeDriver alt ){
+            if( driver instanceof AltGCodeDriver ){
+                var alt = (AltGCodeDriver) driver;
                 var gcode = GcodeCommand.create(cmd).timeout(5000)
                         .confirmRegex(driver.getCommand(null, CommandType.COMMAND_CONFIRM_REGEX));
                 var future = alt.sendGcodeGetReplyFuture(gcode);

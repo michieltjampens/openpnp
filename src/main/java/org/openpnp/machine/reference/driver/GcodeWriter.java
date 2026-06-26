@@ -101,8 +101,9 @@ public class GcodeWriter implements Writable {
         if( writer.writeLine(id(),cmd.command()) ) { // No idea how long this takes
             if( cmd.markSendOk() ) {
                 if (state.compareAndSet(STREAM_STATE.SEND_REQUEST, STREAM_STATE.SEND_OK)) {
-                    if( timeoutFuture != null )
+                    if( timeoutFuture != null ) {
                         timeoutFuture.cancel(true);
+                    }
                     timeoutFuture = timedExecutor.schedule(this::timeoutOccurred, cmd.timeout(), TimeUnit.MILLISECONDS);
                 } else {
                     System.out.println("2b Transmission already handled: " + state.get());

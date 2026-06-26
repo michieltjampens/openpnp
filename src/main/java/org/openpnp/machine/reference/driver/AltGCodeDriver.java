@@ -46,8 +46,9 @@ public class AltGCodeDriver extends GcodeDriver {
             Logger.error("No valid gcode writer available");
             return;
         }
-        if( gCode.isInvalid())
+        if( gCode.isInvalid()) {
             return;
+        }
         if ( gCode.timeout() == -1) {
             gCode.timeout( infinityTimeoutMilliseconds);
         }
@@ -525,14 +526,16 @@ public class AltGCodeDriver extends GcodeDriver {
                                 throw new RuntimeException(e);
                             }
                         break;
-                        case CONFIRMED,CONFIRM_REGEX_FAILED:
+                        case CONFIRMED:
+                        case CONFIRM_REGEX_FAILED:
                             if( cmd.isLocationReply() ){
                                 processPositionReport( new Line(cmd.reply()) );
                             }else if( cmd.hasFuture() ){
                                 cmd.completeFuture();
                             }
-                            if( cmd.isConfirmed())
+                            if( cmd.isConfirmed()) {
                                 cmd.doConfirmation();
+                            }
                             break;
                         case ERROR_REPLY:
                             org.pmw.tinylog.Logger.error("{} error response from controller: {}", cmd.reply(), gcodeWriter.id());

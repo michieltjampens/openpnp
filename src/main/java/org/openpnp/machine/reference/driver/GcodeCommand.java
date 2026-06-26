@@ -34,8 +34,9 @@ public class GcodeCommand {
      * @param command
      */
     private GcodeCommand(String command){
-        if( command==null)
+        if( command==null) {
             return;
+        }
         this.command = command.strip();
     }
 
@@ -67,8 +68,9 @@ public class GcodeCommand {
         return this;
     }
     public GcodeCommand confirmRegex(String confirmRegex){
-        if(confirmRegex==null)
+        if(confirmRegex==null) {
             return this;
+        }
         this.originalRegex=confirmRegex;
         this.confirmRegex = Pattern.compile(confirmRegex,Pattern.CASE_INSENSITIVE).asMatchPredicate();
         return this;

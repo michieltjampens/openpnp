@@ -100,10 +100,10 @@ public class SerialPortCommunications extends ReferenceDriverCommunications {
     public synchronized void connect() throws Exception {
         disconnect();
 
-        stream = new SerialStream(portName);
-        stream.setEol("\n");
-        stream.setPort(portName);
-        stream.initAndConnect();
+        stream = new SerialStream(portName);    // Portname used as id
+        stream.setEol("\n"); // change the eol sequence
+        stream.setPort(portName); // Set the physical port
+        stream.initAndConnect(); // Connect it
 
         serialPort = stream.getSerialPort();
         serialPort.setComPortParameters(baud, dataBits.mask, stopBits.mask, parity.mask);
