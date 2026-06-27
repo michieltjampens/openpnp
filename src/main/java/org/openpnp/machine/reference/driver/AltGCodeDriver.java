@@ -5,7 +5,11 @@ import org.openpnp.machine.reference.ReferenceMachine;
 import org.openpnp.machine.reference.SimulationModeMachine;
 import org.openpnp.model.AxesLocation;
 import org.openpnp.model.Configuration;
+import org.openpnp.model.Length;
+import org.openpnp.model.LengthUnit;
 import org.openpnp.spi.*;
+import org.simpleframework.xml.Attribute;
+import org.simpleframework.xml.Element;
 import org.tinylog.Logger;
 
 import java.util.ArrayList;
@@ -23,7 +27,67 @@ public class AltGCodeDriver extends GcodeDriver {
     GCodeCommandRules rules = new GCodeCommandRules();
     boolean checkResponses =true;
     ResponseThread responseThread;
-    List<Line> responses = new ArrayList<>();
+
+    @Attribute(required = false)
+    private int interpolationMaxSteps = 32;
+
+    @Attribute(required = false)
+    private int interpolationJerkSteps = 4; // relative to max acceleration
+
+    @Attribute(required = false)
+    private double interpolationTimeStep = 0.001;
+
+    @Attribute(required = false)
+    private int interpolationMinStep = 16;
+
+    @Element(required = false)
+    private Length junctionDeviation = new Length(0.02, LengthUnit.Millimeters);
+
+    @Override
+    public Integer getInterpolationMaxSteps() {
+        return interpolationMaxSteps;
+    }
+
+    public void setInterpolationMaxSteps(Integer interpolationMaxSteps) {
+        this.interpolationMaxSteps = interpolationMaxSteps;
+    }
+
+    @Override
+    public Integer getInterpolationJerkSteps() {
+        return interpolationJerkSteps;
+    }
+
+    public void setInterpolationJerkSteps(Integer interpolationJerkSteps) {
+        this.interpolationJerkSteps = interpolationJerkSteps;
+    }
+
+    @Override
+    public Double getInterpolationTimeStep() {
+        return interpolationTimeStep;
+    }
+
+    public void setInterpolationTimeStep(Double interpolationTimeStep) {
+        this.interpolationTimeStep = interpolationTimeStep;
+    }
+
+    @Override
+    public Integer getInterpolationMinStep() {
+        return interpolationMinStep;
+    }
+
+    public void setInterpolationMinStep(Integer interpolationMinStep) {
+        this.interpolationMinStep = interpolationMinStep;
+    }
+
+    @Override
+    public Length getJunctionDeviation() {
+        return junctionDeviation;
+    }
+
+    public void setJunctionDeviation(Length junctionDeviation) {
+        this.junctionDeviation = junctionDeviation;
+    }
+
 
     public void startResponseHandler(){
         responseThread = new ResponseThread();
