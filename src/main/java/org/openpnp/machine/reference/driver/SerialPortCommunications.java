@@ -4,8 +4,6 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.concurrent.TimeoutException;
 
-import eu.settlabs.streams.BaseStream;
-import eu.settlabs.streams.serialport.SerialStream;
 import org.simpleframework.xml.Attribute;
 
 import com.fazecast.jSerialComm.SerialPort;
@@ -93,22 +91,17 @@ public class SerialPortCommunications extends ReferenceDriverCommunications {
     @Attribute(required = false)
     protected String name = "SerialPortCommunications";
 
-    private SerialStream stream;
+
     private SerialPort serialPort;
 
     @Override
     public synchronized void connect() throws Exception {
         disconnect();
-
-        stream = new SerialStream(portName);    // Portname used as id
-        stream.setEol("\n"); // change the eol sequence
-        stream.setPort(portName); // Set the physical port
-        stream.initAndConnect(); // Connect it
-
-        serialPort = stream.getSerialPort();
+        serialPort = SerialPort.getCommPort(portName);
+        serialPort.flushIOBuffers();
+        serialPort.openPort(0);
         serialPort.setComPortParameters(baud, dataBits.mask, stopBits.mask, parity.mask);
         serialPort.setFlowControl(flowControl.mask);
-
         if (setDtr) {
             serialPort.setDTR();
         }
@@ -118,13 +111,12 @@ public class SerialPortCommunications extends ReferenceDriverCommunications {
         serialPort.setComPortTimeouts(
                 SerialPort.TIMEOUT_READ_SEMI_BLOCKING | SerialPort.TIMEOUT_WRITE_BLOCKING, 0, 0);
     }
-    public BaseStream getBaseStream(){
-        return stream;
-    }
+
     @Override
     public synchronized void disconnect() throws Exception {
-        if( stream != null ) {
-            stream.disconnect();
+        if (serialPort != null && serialPort.isOpen()) {
+            serialPort.closePort();
+            serialPort = null;
         }
     }
 
