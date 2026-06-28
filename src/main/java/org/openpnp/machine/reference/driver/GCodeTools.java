@@ -1,5 +1,8 @@
 package org.openpnp.machine.reference.driver;
 
+import eu.settlabs.util.tools.TimeTools;
+import org.apache.commons.lang3.math.NumberUtils;
+
 import static org.openpnp.machine.reference.driver.AbstractReferenceDriver.unescape;
 
 public class GCodeTools {
@@ -111,5 +114,14 @@ public class GCodeTools {
             }
         }
         return 0;
+    }
+    public static long periodStringToMillis( String period ){
+        long millis;
+        if( NumberUtils.isDigits(period) ){
+            millis = Long.parseLong(period);
+        }else {
+            millis = TimeTools.parsePeriodStringToMillis(period);
+        }
+        return millis;
     }
 }

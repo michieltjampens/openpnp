@@ -1,9 +1,10 @@
 package org.openpnp.machine.reference.driver;
 
 import eu.settlabs.core.interfaces.Writable;
-import eu.settlabs.streams.BaseStream;
+import eu.settlabs.core.base.BaseStream;
 import org.tinylog.Logger;
 
+import java.time.Instant;
 import java.util.Arrays;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicReference;
@@ -13,7 +14,7 @@ public class GcodeWriter implements Writable {
     private final LinkedBlockingDeque<GcodeCommand> pendingCommands = new LinkedBlockingDeque<>();
     private final LinkedBlockingDeque<GcodeCommand> responseQueue = new LinkedBlockingDeque<>();
 
-    private final BaseStream controller;
+    private BaseStream controller;
     private Writable writer;
 
     public enum STREAM_STATE{IDLE,SEND_REQUEST,SEND_ERROR,QUEUE_ERROR,TIMEOUT, SEND_OK,WAITING};
@@ -25,15 +26,42 @@ public class GcodeWriter implements Writable {
     private final ScheduledExecutorService timedExecutor = Executors.newScheduledThreadPool(1);
     private ScheduledFuture<?> timeoutFuture;
 
-    public GcodeWriter(GCodeCommandRules rules, BaseStream controller) {
-        this.controller = controller;
+    private long homeTimeout=-1;
+    private long lastTimestamp=-1;
+
+    public GcodeWriter(GCodeCommandRules rules ) {
+        this.rules = rules;
+    }
+    public void setBaseStream( BaseStream controller) {
+        if ( controller==null) {
+            return;
+        }
+        if( this.controller != null){
+            this.controller.disconnect();
+        }
+        this.controller=controller;
         if( controller.isWritable()) {
             writer = (Writable) controller;
             controller.addTarget(this);
         }
-        this.rules = rules;
     }
-
+    public BaseStream getBaseStream() {
+        return controller;
+    }
+    public void disconnect() {
+        if( controller != null){
+            controller.disconnect();
+        }
+    }
+    public void enableGlobalHomeTimeout( String timeout ) {
+        enableGlobalHomeTimeout( GCodeTools.periodStringToMillis( timeout ) );
+    }
+    public void enableGlobalHomeTimeout( long timeout ) {
+        if( timeout <= 5000 )
+            return;
+        this.homeTimeout=timeout;
+        timedExecutor.schedule(this::homeValidTimeoutOccurred, timeout, TimeUnit.MILLISECONDS);
+    }
     public void drainCommandQueue(long timeout){
         // TODO Figure out what the purpose of this actually is?
     }
@@ -75,6 +103,9 @@ public class GcodeWriter implements Writable {
     public boolean inErrorState(){
         return state.get() == STREAM_STATE.SEND_ERROR || state.get() == STREAM_STATE.QUEUE_ERROR;
     }
+    public boolean isMotionPending(){
+        return !pendingCommands.isEmpty();
+    }
     public STREAM_STATE addGcodeCommand( GcodeCommand cmd ){
         pendingCommands.offer( cmd );
         if( pendingCommands.size()==1) {
@@ -99,12 +130,13 @@ public class GcodeWriter implements Writable {
         //System.out.println("1 Sending:"+cmd.command()+" while state:"+state.get());
         cmd.markUnderway();
         if( writer.writeLine(id(),cmd.command()) ) { // No idea how long this takes
+            lastTimestamp = Instant.now().toEpochMilli();
             if( cmd.markSendOk() ) {
                 if (state.compareAndSet(STREAM_STATE.SEND_REQUEST, STREAM_STATE.SEND_OK)) {
                     if( timeoutFuture != null ) {
                         timeoutFuture.cancel(true);
                     }
-                    timeoutFuture = timedExecutor.schedule(this::timeoutOccurred, cmd.timeout(), TimeUnit.MILLISECONDS);
+                    timeoutFuture = timedExecutor.schedule(this::replyTimeoutOccurred, cmd.timeout(), TimeUnit.MILLISECONDS);
                 } else {
                     System.out.println("2b Transmission already handled: " + state.get());
                 }
@@ -149,7 +181,7 @@ public class GcodeWriter implements Writable {
         }
     }
 
-    public void timeoutOccurred(){
+    private void replyTimeoutOccurred(){
 
         STREAM_STATE previous = state.getAndSet(STREAM_STATE.TIMEOUT); // or TIMEOUT, if you track it separately
         if (previous == STREAM_STATE.SEND_OK || previous == STREAM_STATE.SEND_REQUEST) {
@@ -165,11 +197,18 @@ public class GcodeWriter implements Writable {
             // don't double-complete cmd, don't fire callbacks for a finished command
         }
     }
-
+    private void homeValidTimeoutOccurred(){
+        var left = Instant.now().toEpochMilli() - lastTimestamp;
+        if( left+5 > homeTimeout || lastTimestamp==-1){ // Some margin
+            responseQueue.add( GcodeCommand.create("unhome").markAsUnsolicited() );
+            left = homeTimeout;
+        }
+        timedExecutor.schedule(this::homeValidTimeoutOccurred, left, TimeUnit.MILLISECONDS);
+    }
     /* ***** Writable  **** */
     @Override
     public boolean writeLine(String origin, String msg) {
-       // System.out.println("Received:"+msg);
+        lastTimestamp = Instant.now().toEpochMilli();
         msg=msg.trim();
         // Anything received is assumed to be a reply to what was last send
         // Do this first just to be sure it won't trigger during processing
@@ -182,7 +221,7 @@ public class GcodeWriter implements Writable {
         }
         // Got a line and it matches the regex
         var item = pendingCommands.getFirst(); // Peeks at the top, doesn't remove it yet
-        item.markReplied(msg);
+        item.markReplied(msg); // This line actually marks it as replied and checks confirmed
         if( item.command().startsWith("$") ){
             if( state.compareAndSet(STREAM_STATE.SEND_OK, STREAM_STATE.WAITING) ) {
                 timedExecutor.schedule(this::stopWaiting, rules.getDollarWaitTimeMilliseconds(), TimeUnit.MILLISECONDS);
@@ -191,12 +230,14 @@ public class GcodeWriter implements Writable {
             }
         }
         if( !rules.isErrorMessage(msg) ){ // Or try again logic?
-            pendingCommands.removeFirst();
             if( item.isConfirmed() ) {
+                pendingCommands.removeFirst();
                // System.out.println("confirmed:"+item.command()+" with "+item.reply());
                 org.pmw.tinylog.Logger.trace("[{}] confirmed {}", id(), item.command());
             }else{
                 System.out.println("NOT confirmed:"+item.command());
+                if( item.alsoCheckNextLine()) // Allows checking multiple lines
+                    return true;
             }
             if( state.compareAndSet(STREAM_STATE.SEND_OK, STREAM_STATE.IDLE) ) {
                 //System.out.println("Back to idle");

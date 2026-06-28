@@ -1,5 +1,6 @@
 package org.openpnp.machine.reference.driver;
 
+import eu.settlabs.serialport.SerialStream;
 import org.openpnp.machine.reference.ReferenceActuator;
 import org.openpnp.machine.reference.ReferenceMachine;
 import org.openpnp.machine.reference.SimulationModeMachine;
@@ -23,8 +24,10 @@ import java.util.regex.Pattern;
 
 public class AltGCodeDriver extends GcodeDriver {
 
-    GcodeWriter gcodeWriter;
+
     GCodeCommandRules rules = new GCodeCommandRules();
+    GcodeWriter gcodeWriter = new GcodeWriter(rules);
+
     boolean checkResponses =true;
     ResponseThread responseThread;
 
@@ -42,6 +45,9 @@ public class AltGCodeDriver extends GcodeDriver {
 
     @Element(required = false)
     private Length junctionDeviation = new Length(0.02, LengthUnit.Millimeters);
+
+    @Attribute(required = false)
+    private String homeValidTimeout = "0s";
 
     @Override
     public Integer getInterpolationMaxSteps() {
@@ -106,15 +112,15 @@ public class AltGCodeDriver extends GcodeDriver {
         sendGcode( GcodeCommand.create(gCode).timeout( timeout ) );
     }
     protected void sendGcode( GcodeCommand gCode ){
-        if( gcodeWriter == null ){
-            Logger.error("No valid gcode writer available");
-            return;
-        }
+
         if( gCode.isInvalid()) {
             return;
         }
         if ( gCode.timeout() == -1) {
             gCode.timeout( infinityTimeoutMilliseconds);
+        }
+        if (getFirmwareProperty("FIRMWARE_NAME", "").contains("Marlin")) {
+            gCode.linesToCheck(2);
         }
         gcodeWriter.sendGcode( gCode );
     }
@@ -141,13 +147,37 @@ public class AltGCodeDriver extends GcodeDriver {
         }
         return null;
     }
-    public static String waitForReply(CompletableFuture<String> future, long timeout ) {
-        try {
-            return future.get(timeout, TimeUnit.MILLISECONDS);
-        } catch (TimeoutException | InterruptedException | ExecutionException e) {
-            Logger.error("Timeout while waiting for firmware report");
+    @Override
+    public boolean isMotionPending() {
+        return gcodeWriter.isMotionPending();
+    }
+    @Override
+    public void waitForCompletion(HeadMountable hm,
+                                  MotionPlanner.CompletionType completionType) throws Exception {
+        if (!(completionType.isUnconditionalCoordination()
+                || isMotionPending())) {
+            return;
         }
-        return null;
+        // New
+        var gcode = GcodeCommand.create( getCommand(hm, CommandType.MOVE_TO_COMPLETE_COMMAND) );
+        if ( !gcode.isInvalid()) { // Checks command being null
+            var timeout = completionType == MotionPlanner.CompletionType.WaitForStillstandIndefinitely ?
+                    -1 : getTimeoutAtMachineSpeed();
+            gcode.timeout( timeout )
+                    .confirmRegex( getCommand(hm, CommandType.MOVE_TO_COMPLETE_REGEX) ); // If null, default is still used
+            var future = sendGcodeGetReplyFuture( gcode ); // A future completed upon VALID reply
+            // By default, the driver will check till timeout expired. So I could make a future that is triggered
+            // by the driver receiving timeout notification but than the future would use get() and hand if something
+            // goes wrong. This was (get a confirm with some margin) does the same thing
+            // If timeout is -1, the earlier sendgocdegetreply replaces that with the default
+            if( future.get(gcode.timeout()+5, TimeUnit.MILLISECONDS)==null ) { // Waiting at most the same time as the timeout
+                throw new Exception("Timed out waiting for move to complete.");
+            }
+            if (completionType.isEnforcingStillstand()){
+                // Remember, we're now standing still.
+                motionPending = false;
+            }
+        }
     }
     @Override
     protected void detectFirmwareSequence() throws Exception {
@@ -266,13 +296,30 @@ public class AltGCodeDriver extends GcodeDriver {
         disconnectRequested = false;
         getCommunications().setDriverName(getName());
         org.pmw.tinylog.Logger.debug("[{}] Connect", getCommunications().getConnectionName());
-        getCommunications().connect();
 
-        if( getCommunications() instanceof SerialPortCommunications) {
-            var comms = (SerialPortCommunications)getCommunications();
+        if(getCommunications() instanceof SerialPortCommunications comms) {
             rules.setCleaning(compressGcode,removeComments);
             rules.setLogging( loggingGcode );
-            gcodeWriter = new GcodeWriter(rules, comms.getBaseStream());
+
+            if( gcodeWriter.getBaseStream() == null ) {
+                gcodeWriter.setBaseStream( new SerialStream(comms.getPortName()) );
+            }
+
+            var stream = (SerialStream) gcodeWriter.getBaseStream();
+            stream.disconnect();
+
+            stream.setPort(comms.getPortName()); // Doesn't do anything if this didn't change
+
+            var port = stream.getSerialPort();
+            port.setBaudRate(comms.getBaud());
+            port.setFlowControl(comms.getFlowControl().mask );
+            port.setNumStopBits( comms.getStopBits().mask );
+            port.setBaudRate( comms.getBaud() );
+
+            stream.initAndConnect();
+        }else{
+            Logger.error("TCP not supported yet");
+            return;
         }
         connected = false;
 
@@ -302,6 +349,22 @@ public class AltGCodeDriver extends GcodeDriver {
 
         // reset send-on-change behavior
         sendOnChangeResetAll();
+    }
+    public synchronized void disconnect() {
+        disconnectRequested = true;
+        connected = false;
+
+        try {
+            //getCommunications().disconnect();
+
+        }
+        catch (Exception e) {
+            org.pmw.tinylog.Logger.error(e, "disconnect()");
+        }
+
+        disconnectThreads();
+
+        closeGcodeLogger();
     }
     @Override
     public void setEnabled(boolean enabled) throws Exception {
@@ -594,8 +657,6 @@ public class AltGCodeDriver extends GcodeDriver {
                         case CONFIRM_REGEX_FAILED:
                             if( cmd.isLocationReply() ){
                                 processPositionReport( new Line(cmd.reply()) );
-                            }else if( cmd.hasFuture() ){
-                                cmd.completeFuture();
                             }
                             if( cmd.isConfirmed()) {
                                 cmd.doConfirmation();
@@ -611,7 +672,12 @@ public class AltGCodeDriver extends GcodeDriver {
                         case MAYBE_LOCATION:
                             processPositionReport(new Line(cmd.reply()));
                             break;
-                        case UNSOLICITED:break;
+                        case UNSOLICITED:
+                            if(cmd.command().equals("unhome") ){
+                                Configuration.get().getMachine().getMotionPlanner().unhome();
+                                Logger.warn("Idle time passed, marking home as invalid.");
+                            }
+                            break;
                     };
                 } catch (InterruptedException ignored) {
 
