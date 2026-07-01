@@ -4,7 +4,6 @@ import java.awt.Font;
 import java.awt.event.ActionEvent;
 import java.awt.event.KeyAdapter;
 import java.awt.event.KeyEvent;
-import java.util.concurrent.TimeUnit;
 
 import javax.swing.AbstractAction;
 import javax.swing.Action;
@@ -193,9 +192,8 @@ public class GcodeDriverConsole extends AbstractConfigurationWizard {
                 var gcode = GcodeCommand.create(cmd).timeout(5000)
                         .confirmRegex(driver.getCommand(null, CommandType.COMMAND_CONFIRM_REGEX))
                         .linesToCheck(100);
-                var future = alt.sendGcodeGetReplyFuture(gcode);
-                var reply = future.get(driver.getTimeoutMilliseconds(), TimeUnit.MILLISECONDS); // No idea why this isn't also 5000
-                reply = reply==null?">Timeout\n":String.join("\n",gcode.replyAsList());
+                alt.sendSyncGcode(gcode); // This is the blocking one
+                var reply = gcode.reply()==null?">Timeout\n":String.join("\n",gcode.replyAsList());
                 textAreaConsole.append(alt.getName()+">"+reply);
             }else{
                 driver.sendCommand(cmd, 5000);

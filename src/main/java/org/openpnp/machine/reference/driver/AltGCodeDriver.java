@@ -4,6 +4,7 @@ import eu.settlabs.serialport.SerialStream;
 import org.openpnp.machine.reference.ReferenceActuator;
 import org.openpnp.machine.reference.ReferenceMachine;
 import org.openpnp.machine.reference.SimulationModeMachine;
+import org.openpnp.machine.reference.driver.exceptions.*;
 import org.openpnp.model.AxesLocation;
 import org.openpnp.model.Configuration;
 import org.openpnp.model.Length;
@@ -15,10 +16,8 @@ import org.tinylog.Logger;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -30,6 +29,22 @@ public class AltGCodeDriver extends GcodeDriver {
 
     boolean checkResponses =true;
     ResponseThread responseThread;
+    private int confirmsNeeded=1;
+
+    @Attribute(required=false)
+    private long writerPollingInterval = 100;
+
+    @Attribute(required=false)
+    private long writerQueueTimeout = 60000;
+
+    @Attribute(required=false)
+    private int maxCommandsQueued = 1000;
+
+    @Attribute(required=false)
+    private boolean confirmationFlowControl = true;
+
+    @Attribute(required=false)
+    private boolean reportedLocationConfirmation = true;
 
     @Attribute(required = false)
     private int interpolationMaxSteps = 32;
@@ -102,32 +117,59 @@ public class AltGCodeDriver extends GcodeDriver {
     }
     @Override
     public void sendCommand(String command) throws Exception {
-        sendGcode(GcodeCommand.create(command).timeout( timeoutMilliseconds ));
+        sendSyncGcode(GcodeCommand.create(command).timeout( timeoutMilliseconds ));
     }
     public void sendCommand(String command, long timeout) throws Exception {
-        sendGcode(GcodeCommand.create(command).timeout( timeout ));
+        sendSyncGcode(GcodeCommand.create(command).timeout( timeout ));
     }
     @Override
     protected void sendGcode(String gCode, long timeout) throws Exception {
-        sendGcode( GcodeCommand.create(gCode).timeout( timeout ) );
+        var gcode = GcodeCommand.create(gCode).timeout( timeout ).enableFuture();
+        sendAsyncGcode( gcode );
     }
-    protected void sendGcode( GcodeCommand gCode ){
-
+    public void sendSyncGcode(GcodeCommand gcode) throws GcodeException {
+        gcode.enableFuture();
+        if( gcode.isInvalid() )
+            return;
+        sendAsyncGcode(gcode);
+        try {
+            gcode.replyFuture().get(); // no timeout arg — orTimeout/replyTimeoutOccurred guarantee completion
+        } catch (ExecutionException e) {
+            switch (e.getCause()) {
+                case GcodeTimeoutException te -> {
+                    System.err.println("Timed out: " + te.getMessage());
+                    throw te;
+                }
+                case GcodeErrorReplyException ee -> {
+                    System.err.println("Controller error: " + ee.command().reply());
+                }
+                case GcodeSendFailedException se -> {
+                    System.err.println("Couldn't send: " + se.getMessage());
+                }
+                case GcodeRegexMismatchException re -> {
+                    System.err.println("Unexpected reply: " + re.command().reply());
+                }
+                default -> {
+                    System.err.println("Unknown failure: " + e.getCause());
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+    protected void sendAsyncGcode( GcodeCommand gCode ){
         if( gCode.isInvalid()) {
             return;
         }
         if ( gCode.timeout() == -1) {
             gCode.timeout( infinityTimeoutMilliseconds);
         }
+
         if (getFirmwareProperty("FIRMWARE_NAME", "").contains("Marlin")) {
             gCode.linesToCheck(2);
         }
+       // gCode.confirmsNeeded(confirmsNeeded);
         gcodeWriter.sendGcode( gCode );
-    }
-    public CompletableFuture<String> sendGcodeGetReplyFuture( GcodeCommand gCode){
-        gCode.createReplyFuture();
-        sendGcode(gCode);
-        return gCode.replyFuture();
     }
 
     public void setCommand(HeadMountable hm, CommandType type, String text) {
@@ -139,14 +181,6 @@ public class AltGCodeDriver extends GcodeDriver {
         }
     }
 
-    private String waitForReply(CompletableFuture<String> future ) {
-        try {
-            return future.get(timeoutMilliseconds, TimeUnit.MILLISECONDS);
-        } catch (TimeoutException | InterruptedException | ExecutionException e) {
-            Logger.error("Timeout while waiting for firmware report");
-        }
-        return null;
-    }
     @Override
     public boolean isMotionPending() {
         return gcodeWriter.isMotionPending();
@@ -160,45 +194,42 @@ public class AltGCodeDriver extends GcodeDriver {
         }
         // New
         var gcode = GcodeCommand.create( getCommand(hm, CommandType.MOVE_TO_COMPLETE_COMMAND) );
-        if ( !gcode.isInvalid()) { // Checks command being null
-            var timeout = completionType == MotionPlanner.CompletionType.WaitForStillstandIndefinitely ?
-                    -1 : getTimeoutAtMachineSpeed();
-            gcode.timeout( timeout )
-                    .confirmRegex( getCommand(hm, CommandType.MOVE_TO_COMPLETE_REGEX) ); // If null, default is still used
-            var future = sendGcodeGetReplyFuture( gcode ); // A future completed upon VALID reply
-            // By default, the driver will check till timeout expired. So I could make a future that is triggered
-            // by the driver receiving timeout notification but than the future would use get() and hand if something
-            // goes wrong. This was (get a confirm with some margin) does the same thing
-            // If timeout is -1, the earlier sendgocdegetreply replaces that with the default
-            if( future.get(gcode.timeout()+5, TimeUnit.MILLISECONDS)==null ) { // Waiting at most the same time as the timeout
-                throw new Exception("Timed out waiting for move to complete.");
-            }
-            if (completionType.isEnforcingStillstand()){
-                // Remember, we're now standing still.
-                motionPending = false;
-            }
+        if ( gcode.isInvalid()) { // Checks command being null
+            return;
+        }
+        var timeout = completionType == MotionPlanner.CompletionType.WaitForStillstandIndefinitely ?
+                -1 : getTimeoutAtMachineSpeed();
+        gcode.timeout( timeout )
+                .confirmRegex( getCommand(hm, CommandType.MOVE_TO_COMPLETE_REGEX) ); // If null, default is still used
+        sendSyncGcode( gcode ); // A blocking method until either timeout or valid reply
+        // By default, the driver will check till timeout expired. So I could make a future that is triggered
+        // by the driver receiving timeout notification but than the future would use get() and hand if something
+        // goes wrong. This was (get a confirm with some margin) does the same thing
+        // If timeout is -1, the earlier sendgocdegetreply replaces that with the default
+        if (completionType.isEnforcingStillstand()){
+            // Remember, we're now standing still.
+            motionPending = false;
         }
     }
     @Override
     protected void detectFirmwareSequence() throws Exception {
         org.pmw.tinylog.Logger.debug("=== Detecting firmware and position reporting, please ignore any errors and warnings.");
-
-        var replyFuture =  sendGcodeGetReplyFuture( GcodeCommand.create("M115").confirmRegex("^.*FIRMWARE.*") );
-        String firmware = waitForReply(replyFuture);
-        if (firmware != null) {
-            setDetectedFirmware(firmware);
+        var firmwareGcode = GcodeCommand.create("M115").confirmRegex("^.*FIRMWARE.*");
+        sendSyncGcode( firmwareGcode );
+        if ( firmwareGcode.isConfirmed() ) {
+            setDetectedFirmware(firmwareGcode.reply());
         }
 
-        replyFuture = sendGcodeGetReplyFuture( GcodeCommand.create("M114").confirmRegex(".*[XYZABCDEUVW]:-?\\d+\\.\\d+.*") );
-        String reportedAxes = waitForReply(replyFuture);
-        if (reportedAxes != null) {
-            if (firmware != null) {
+        var axesGcode = GcodeCommand.create("M114").confirmRegex(".*[XYZABCDEUVW]:-?\\d+\\.\\d+.*");
+        sendSyncGcode( axesGcode );
+        if (axesGcode.isConfirmed()) {
+            if (firmwareGcode.isConfirmed() ) {
                 try {
                     if (getFirmwareProperty("FIRMWARE_NAME", "").contains("Duet")) {
-                        var driverReply = sendGcodeGetReplyFuture(GcodeCommand.create("M584").confirmRegex("^Driver assignments:.*"));
-                        String axisConfig = waitForReply( driverReply );
-                        if (axisConfig != null) {
-                            setConfiguredAxes(axisConfig);
+                        var driverAsignGcode = GcodeCommand.create("M584").confirmRegex("^Driver assignments:.*");
+                        sendSyncGcode(driverAsignGcode);
+                        if (driverAsignGcode.isConfirmed()) {
+                            setConfiguredAxes(driverAsignGcode.reply());
                         }
                     }
                     else {
@@ -237,7 +268,7 @@ public class AltGCodeDriver extends GcodeDriver {
                 .confirmRegex( getCommand(null, CommandType.HOME_COMPLETE_REGEX) )
                 .onLastConfirmation(()->homeConfirmed(machine))
                 .onTimeOut(()->Logger.error("Timed out waiting for home to complete."));
-        sendGcode(homeCmd);
+        sendSyncGcode(homeCmd); // Blocks and throws exceptions
     }
     private String alterFeedsAndSpeeds(String command, AxesLocation axesHomeLocation, ReferenceMachine machine ) throws Exception {
         Double feedrate = null;
@@ -300,12 +331,18 @@ public class AltGCodeDriver extends GcodeDriver {
         if(getCommunications() instanceof SerialPortCommunications comms) {
             rules.setCleaning(compressGcode,removeComments);
             rules.setLogging( loggingGcode );
-
+            gcodeWriter.setId(getName());
             if( gcodeWriter.getBaseStream() == null ) {
                 gcodeWriter.setBaseStream( new SerialStream(comms.getPortName()) );
+                gcodeWriter.enableGlobalHomeTimeout(homeValidTimeout);
+            }
+            if (getFirmwareProperty("FIRMWARE_NAME", "").contains("Smoothie")){
+                System.out.println("Smoothieware detected, defaulting to two confirms.");
+                confirmsNeeded=2;
             }
 
             var stream = (SerialStream) gcodeWriter.getBaseStream();
+            stream.setEol( comms.getLineEndingType().lineEnding );
             stream.disconnect();
 
             stream.setPort(comms.getPortName()); // Doesn't do anything if this didn't change
@@ -343,7 +380,7 @@ public class AltGCodeDriver extends GcodeDriver {
         // Send startup Gcode
         var connect = getCommand(null, CommandType.CONNECT_COMMAND);
         var cmd = GcodeCommand.create(connect);
-        sendGcode( cmd );   // TODO Nothing is done with the reply??
+        sendAsyncGcode( cmd );   // TODO Nothing is done with the reply??
 
         connected = true;
 
@@ -353,18 +390,9 @@ public class AltGCodeDriver extends GcodeDriver {
     public synchronized void disconnect() {
         disconnectRequested = true;
         connected = false;
-
-        try {
-            //getCommunications().disconnect();
-
-        }
-        catch (Exception e) {
-            org.pmw.tinylog.Logger.error(e, "disconnect()");
-        }
+        gcodeWriter.disconnect();
 
         disconnectThreads();
-
-        closeGcodeLogger();
     }
     @Override
     public void setEnabled(boolean enabled) throws Exception {
@@ -373,11 +401,11 @@ public class AltGCodeDriver extends GcodeDriver {
         }
         if (connected) {
             if (enabled) {
-                sendGcode( GcodeCommand.create( getCommand(null, CommandType.ENABLE_COMMAND)) );
+                sendAsyncGcode( GcodeCommand.create( getCommand(null, CommandType.ENABLE_COMMAND)) );
             }
             else {
                 try {
-                    sendGcode( GcodeCommand.create(getCommand(null, CommandType.DISABLE_COMMAND)) );
+                    sendAsyncGcode( GcodeCommand.create(getCommand(null, CommandType.DISABLE_COMMAND)) );
                     gcodeWriter.drainCommandQueue(getTimeoutAtMachineSpeed());
                     /* TODO figure out what the intention is
                         The disable command should probably be understood by the writer to cease all activity
@@ -419,7 +447,7 @@ public class AltGCodeDriver extends GcodeDriver {
 
         command = substituteVariable(command, "TimeMS", milliseconds);
         command = substituteVariable(command, "TimeSeconds", (double)milliseconds / 1000.0);
-        sendGcode( GcodeCommand.create(command) );
+        sendSyncGcode( GcodeCommand.create(command) );
 
         // consider this delay a pending motion for subsequent WaitForCompletion to actually
         // wait which might otherwise be optimized away.
@@ -477,7 +505,7 @@ public class AltGCodeDriver extends GcodeDriver {
         if (!isEmpty) {
             // If no axes are included, the G92 command must not be executed, because it would otherwise reset all
             // axes to zero in some controllers!
-            sendGcode( GcodeCommand.create(command).timeout(-1) ); // -1 is also default, but just in case
+            sendAsyncGcode( GcodeCommand.create(command).timeout(-1) ); // -1 is also default, but just in case
         }
     }
     private void doLegacyPostVisionHome( AxesLocation axesLocation) throws Exception {
@@ -494,7 +522,7 @@ public class AltGCodeDriver extends GcodeDriver {
         postVisionHomeCommand = substituteVariable(postVisionHomeCommand, "Y",
                 axesLocation.getCoordinate(axisY, getUnits()));
         // Execute the command
-        sendGcode( GcodeCommand.create(postVisionHomeCommand)
+        sendAsyncGcode( GcodeCommand.create(postVisionHomeCommand)
                 .timeout(-1)
                 .onLastConfirmation(()->alterHomeCoords(axesLocation) ) );
     }
@@ -526,7 +554,7 @@ public class AltGCodeDriver extends GcodeDriver {
         var cmd = GcodeCommand.create(command).timeout(-1)
                         .markLocationRequest()
                         .confirmRegex(regex);
-        sendGcode( cmd );
+        sendAsyncGcode( cmd );
 
         // This part can stay because the earlier markLocationRequest makes sure it ends up in this queue
         AxesLocation lastReportedLocation = reportedLocationsQueue.poll(timeout, TimeUnit.MILLISECONDS);
@@ -550,7 +578,7 @@ public class AltGCodeDriver extends GcodeDriver {
             command = substituteVariable(command, "Index", ((ReferenceActuator)actuator).getIndex());
         }
         command = substituteVariable(command, "BooleanValue", on);
-        sendGcode( GcodeCommand.create(command).onLastConfirmation(()->simulateActuate(actuator,on)));
+        sendAsyncGcode( GcodeCommand.create(command).onLastConfirmation(()->simulateActuate(actuator,on)));
     }
     private void simulateActuate(Actuator actuator, Object value) {
         try {
@@ -569,7 +597,7 @@ public class AltGCodeDriver extends GcodeDriver {
         }
         command = substituteVariable(command, "DoubleValue", value);
         command = substituteVariable(command, "IntegerValue", (int) value);
-        sendGcode( GcodeCommand.create(command).onLastConfirmation(()->simulateActuate(actuator,value)));
+        sendSyncGcode( GcodeCommand.create(command).onLastConfirmation(()->simulateActuate(actuator,value)));
     }
     @Override
     public String actuatorRead(Actuator actuator, Object parameter) throws Exception {
@@ -602,29 +630,23 @@ public class AltGCodeDriver extends GcodeDriver {
                     .confirmRegex(regex)
                     .timeout(timeoutMilliseconds)
                     .onTimeOut(()->Logger.error(String.format("Actuator \"%s\" read error: No matching responses found.", actuator.getName())));
-        var waitForValidReply = cmd.createReplyFuture();
-        sendGcode(cmd);
+        sendSyncGcode(cmd);
+        var reply = cmd.reply();
+        org.pmw.tinylog.Logger.trace("actuatorRead response: {}", reply );
 
+        Pattern pattern = Pattern.compile(regex);
+        Matcher matcher = pattern.matcher(reply);
         try {
-            var reply = waitForValidReply.get((long)timeoutMilliseconds, TimeUnit.MILLISECONDS);
-            org.pmw.tinylog.Logger.trace("actuatorRead response: {}", reply );
-
-            Pattern pattern = Pattern.compile(regex);
-            Matcher matcher = pattern.matcher(reply);
-            try {
-                matcher.matches(); // Was checked somewhere else, but needed for .group to work
-                return matcher.group("Value");
-            }
-            catch (IllegalArgumentException e) {
-                throw new Exception(String.format("Actuator \"%s\" read error: Regex is missing \"Value\" capturing group. See https://github.com/openpnp/openpnp/wiki/GcodeDriver#actuator_read_regex",
-                        actuator.getName()), e);
-            }
-            catch (Exception e) {
-                throw new Exception(String.format("Actuator \"%s\" read error: Failed to parse response. See https://github.com/openpnp/openpnp/wiki/GcodeDriver#actuator_read_regex",
-                        actuator.getName()), e);
-            }
-        } catch (TimeoutException e) {
-            throw new Exception("Timeout waiting for actuator read response");
+            matcher.matches(); // Was checked somewhere else, but needed for .group to work
+            return matcher.group("Value");
+        }
+        catch (IllegalArgumentException e) {
+            throw new Exception(String.format("Actuator \"%s\" read error: Regex is missing \"Value\" capturing group. See https://github.com/openpnp/openpnp/wiki/GcodeDriver#actuator_read_regex",
+                    actuator.getName()), e);
+        }
+        catch (Exception e) {
+            throw new Exception(String.format("Actuator \"%s\" read error: Failed to parse response. See https://github.com/openpnp/openpnp/wiki/GcodeDriver#actuator_read_regex",
+                    actuator.getName()), e);
         }
     }
     protected class ResponseThread extends Thread {

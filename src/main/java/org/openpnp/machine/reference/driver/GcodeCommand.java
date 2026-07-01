@@ -1,9 +1,16 @@
 package org.openpnp.machine.reference.driver;
 
+import org.openpnp.machine.reference.driver.exceptions.GcodeErrorReplyException;
+import org.openpnp.machine.reference.driver.exceptions.GcodeRegexMismatchException;
+import org.openpnp.machine.reference.driver.exceptions.GcodeSendFailedException;
+import org.openpnp.machine.reference.driver.exceptions.GcodeTimeoutException;
+
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Predicate;
 import java.util.regex.Pattern;
@@ -20,7 +27,7 @@ public class GcodeCommand {
     private Runnable onTimeOut=()->{};
     private final AtomicReference<COMMAND_STATE> state= new AtomicReference<>(COMMAND_STATE.PENDING);
 
-    public enum COMMAND_STATE{PENDING, UNDERWAY, SEND_OK, FAILED_SEND,CONFIRMED,CONFIRM_REGEX_FAILED, ERROR_REPLY,TIMEOUT, MAYBE_LOCATION, UNSOLICITED};
+    public enum COMMAND_STATE{PENDING, UNDERWAY, SEND_OK, RECEIVE_OK, FAILED_SEND,CONFIRMED,CONFIRM_REGEX_FAILED, ERROR_REPLY,TIMEOUT, MAYBE_LOCATION, UNSOLICITED};
 
     private GCODE_COMMAND gcode=GCODE_COMMAND.STD;
 
@@ -30,8 +37,9 @@ public class GcodeCommand {
     long replyTimestamp=-1;
     List<String> replies=new ArrayList<>();
     private int linesToCheck=1;
+    private int confirmsNeeded=1;
 
-    private CompletableFuture<String> future;
+    private CompletableFuture<GcodeCommand> future;
     /**
      *
      * @param command
@@ -81,11 +89,23 @@ public class GcodeCommand {
         this.confirmRegex = Pattern.compile(confirmRegex,Pattern.CASE_INSENSITIVE).asMatchPredicate();
         return this;
     }
+    public GcodeCommand enableFuture(){
+        if( command != null )
+            future=new CompletableFuture<>();
+        return this;
+    }
     public String confirmRegex( ){
         return this.originalRegex;
     }
     public boolean isDefaultRegex(){
         return  this.originalRegex.equals("^ok.*");
+    }
+    public GcodeCommand confirmsNeeded( int confirmsNeeded ){
+        this.confirmsNeeded = confirmsNeeded;
+        return this;
+    }
+    public boolean isReceived(){
+        return state.get()==COMMAND_STATE.RECEIVE_OK;
     }
     public GcodeCommand onLastConfirmation(Runnable onConfirmation){
         this.onConfirmation = onConfirmation;
@@ -115,29 +135,40 @@ public class GcodeCommand {
     public boolean isConfirmed(){
         return state.get()==COMMAND_STATE.CONFIRMED;
     }
-    public CompletableFuture<String> createReplyFuture(){
-        gcode = GCODE_COMMAND.REPLY_FUTURE;
-        future = new CompletableFuture<>();
-        return future;
+    public boolean isRegexFailed(){
+        return state.get()==COMMAND_STATE.CONFIRM_REGEX_FAILED;
     }
-    public CompletableFuture<String> replyFuture(){
+    public CompletableFuture<GcodeCommand> replyFuture(){
         return this.future;
     }
     public void completeFuture(){
-        if(future != null) {
-            future.complete(isConfirmed()?reply():null);
+        if(future == null) return;
+        switch (state.get()) {
+            case CONFIRMED -> future.complete(this);
+            case TIMEOUT -> future.completeExceptionally(new GcodeTimeoutException(this));
+            case ERROR_REPLY -> future.completeExceptionally(new GcodeErrorReplyException(this, reply()));
+            case FAILED_SEND -> future.completeExceptionally(new GcodeSendFailedException(this));
+            case CONFIRM_REGEX_FAILED -> future.completeExceptionally(new GcodeRegexMismatchException(this, reply()));
+            default -> future.complete(null); // shouldn't normally happen, but don't hang forever
         }
     }
     /* **** Changing the state of the command **** */
     public void markUnderway(){
-        state.compareAndSet(COMMAND_STATE.PENDING,COMMAND_STATE.UNDERWAY);
+        if( state.compareAndSet(COMMAND_STATE.PENDING,COMMAND_STATE.UNDERWAY) ) {
+            if (future != null) {
+                future.orTimeout(timeout + 100, TimeUnit.MILLISECONDS);
+            }
+        }
         System.out.println(command+ " -> Underway to controller.");
     }
     public boolean markSendOk(){
         sendTimestamp= Instant.now().toEpochMilli();
-        if( state.compareAndSet(COMMAND_STATE.UNDERWAY,COMMAND_STATE.SEND_OK) ){
-            System.out.println(command+" -> Send succeeded.");
+        if( state.compareAndSet(COMMAND_STATE.UNDERWAY,COMMAND_STATE.SEND_OK) ) {
+            System.out.println(command + " -> Send succeeded.");
             return true;
+        }else if( state.get() == COMMAND_STATE.RECEIVE_OK ){
+            System.out.println(command + " -> Not marking send ok because already received.");
+            return false;
         }else{
             System.out.println( command+" -> Not marking as send because "+state.get());
             return false;
@@ -157,8 +188,13 @@ public class GcodeCommand {
         linesToCheck--;
         replyTimestamp= Instant.now().toEpochMilli();
         if( confirmRegex.test(reply) ){
-            if( state.compareAndSet(COMMAND_STATE.SEND_OK,COMMAND_STATE.CONFIRMED) ){
+            if( confirmsNeeded == 2 && state.compareAndSet(COMMAND_STATE.SEND_OK,COMMAND_STATE.RECEIVE_OK) ){
+                confirmsNeeded--;
+                System.out.println(command+" -> Receival confirmed.");
+            }else if( state.compareAndSet(COMMAND_STATE.SEND_OK,COMMAND_STATE.CONFIRMED) ){
                 System.out.println( command+" -> Confirmed with " +reply);
+            }else if( state.compareAndSet(COMMAND_STATE.RECEIVE_OK,COMMAND_STATE.CONFIRMED) ){
+                System.out.println( command+" -> Confirmed after receival with " +reply);
             }else if( state.compareAndSet(COMMAND_STATE.UNDERWAY,COMMAND_STATE.CONFIRMED ) ){
                 System.out.println( command+" -> Confirmed with " +reply+" while considered underway!");
             }else if( state.compareAndSet(COMMAND_STATE.CONFIRM_REGEX_FAILED,COMMAND_STATE.CONFIRMED ) ){
@@ -166,11 +202,12 @@ public class GcodeCommand {
             }else{
                 System.err.println( command+" -> Want to mark confirmed but it's now "+state.get());
             }
-            completeFuture();
+            if( state.get() == COMMAND_STATE.CONFIRMED )
+                completeFuture();
         }else{
             if( state.compareAndSet(COMMAND_STATE.SEND_OK,COMMAND_STATE.CONFIRM_REGEX_FAILED) ){
                 System.out.println(command+" -> Transitioned from SEND_OK to "+state.get());
-                System.out.println( command+" -> Regex failed on "+reply );
+                System.out.println( command+" -> Regex failed on "+reply + " vs "+originalRegex );
             }else if( state.compareAndSet(COMMAND_STATE.UNDERWAY,COMMAND_STATE.CONFIRM_REGEX_FAILED ) ){
                 System.out.println( command+" -> Regex failed on "+reply+", even before send_ok, marking as regex_failed...");
             }else if( state.get() != COMMAND_STATE.CONFIRM_REGEX_FAILED ){ // If not already regex failed
@@ -224,6 +261,7 @@ public class GcodeCommand {
         var newCommand = new GcodeCommand(command);
         newCommand.confirmRegex = this.confirmRegex;
         newCommand.onTimeOut = this.onTimeOut;
+        newCommand.confirmsNeeded=this.confirmsNeeded;
         if( this.command.endsWith('\n'+command) || this.command.equals(command)|| !once ) {
             newCommand.onConfirmation = this.onConfirmation;
             newCommand.future=this.future;  // Make sure the future is also taken

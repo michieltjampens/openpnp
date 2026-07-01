@@ -28,9 +28,14 @@ public class GcodeWriter implements Writable {
 
     private long homeTimeout=-1;
     private long lastTimestamp=-1;
+    private String id="gcodewriter";
 
     public GcodeWriter(GCodeCommandRules rules ) {
+
         this.rules = rules;
+    }
+    public void setId( String id ) {
+        this.id=id;
     }
     public void setBaseStream( BaseStream controller) {
         if ( controller==null) {
@@ -43,6 +48,7 @@ public class GcodeWriter implements Writable {
         if( controller.isWritable()) {
             writer = (Writable) controller;
             controller.addTarget(this);
+            System.out.println("Adding "+id()+" as target ");
         }
     }
     public BaseStream getBaseStream() {
@@ -143,7 +149,6 @@ public class GcodeWriter implements Writable {
             }else{
                 // Reply already raced ahead and resolved the command before we could mark SEND_OK.
                 // The transaction is over; settle the stream state to match reality.
-                //System.out.println("2e Command already resolved (" + cmd.state() + ") before send_ok — settling stream state");
                 if (state.compareAndSet(STREAM_STATE.SEND_REQUEST, STREAM_STATE.IDLE)) {
                     if (!pendingCommands.isEmpty()) {
                         sendCommand();
@@ -210,15 +215,18 @@ public class GcodeWriter implements Writable {
     public boolean writeLine(String origin, String msg) {
         lastTimestamp = Instant.now().toEpochMilli();
         msg=msg.trim();
+
         // Anything received is assumed to be a reply to what was last send
         // Do this first just to be sure it won't trigger during processing
         if( timeoutFuture != null ) {
             timeoutFuture.cancel(true);
         }
         if( pendingCommands.isEmpty() ) {
-            responseQueue.offer( GcodeCommand.createDummy(msg) );
+            System.out.println(id+" -> Received line: "+msg+ " but nothing pending");
+            responseQueue.offer( GcodeCommand.createDummy("dummy:"+msg) );
             return true;
         }
+       // System.out.println(id+" -> Received line: "+msg+ " while waiting on reply for "+pendingCommands.getFirst().command());
         // Got a line and it matches the regex
         var item = pendingCommands.getFirst(); // Peeks at the top, doesn't remove it yet
         item.markReplied(msg); // This line actually marks it as replied and checks confirmed
@@ -232,12 +240,14 @@ public class GcodeWriter implements Writable {
         if( !rules.isErrorMessage(msg) ){ // Or try again logic?
             if( item.isConfirmed() ) {
                 pendingCommands.removeFirst();
-               // System.out.println("confirmed:"+item.command()+" with "+item.reply());
                 org.pmw.tinylog.Logger.trace("[{}] confirmed {}", id(), item.command());
-            }else{
+            }else if( item.isReceived()){
+                return true;
+            }else if( item.isRegexFailed() ){
                 System.out.println("NOT confirmed:"+item.command());
                 if( item.alsoCheckNextLine()) // Allows checking multiple lines
                     return true;
+                pendingCommands.removeFirst();
             }
             if( state.compareAndSet(STREAM_STATE.SEND_OK, STREAM_STATE.IDLE) ) {
                 //System.out.println("Back to idle");
@@ -262,7 +272,7 @@ public class GcodeWriter implements Writable {
 
     @Override
     public String id() {
-        return "gcodewriter";
+        return id;
     }
 
     @Override
