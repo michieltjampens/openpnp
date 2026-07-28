@@ -12,7 +12,7 @@ import org.openpnp.model.LengthUnit;
 import org.openpnp.spi.*;
 import org.simpleframework.xml.Attribute;
 import org.simpleframework.xml.Element;
-import org.tinylog.Logger;
+import org.pmw.tinylog.Logger;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -23,11 +23,11 @@ import java.util.regex.Pattern;
 
 public class AltGCodeDriver extends GcodeDriver {
 
-
     GCodeCommandRules rules = new GCodeCommandRules();
     GcodeWriter gcodeWriter = new GcodeWriter(rules);
 
     boolean checkResponses =true;
+    private boolean simulate=false;
     ResponseThread responseThread;
     private int confirmsNeeded=1;
 
@@ -129,28 +129,34 @@ public class AltGCodeDriver extends GcodeDriver {
     }
     public void sendSyncGcode(GcodeCommand gcode) throws GcodeException {
         gcode.enableFuture();
-        if( gcode.isInvalid() )
+        if( gcode.isInvalid() ){
+            Logger.debug("{} -> Invalid gCode command, ignoring: {}",name,gcode.toString());
             return;
+        }
+        if( simulate || name.toLowerCase().contains("feeder")){
+            Logger.debug( "{} -> Simulating, not executing: {}",name,gcode.toString());
+            return;
+        }
         sendAsyncGcode(gcode);
         try {
             gcode.replyFuture().get(); // no timeout arg — orTimeout/replyTimeoutOccurred guarantee completion
         } catch (ExecutionException e) {
             switch (e.getCause()) {
                 case GcodeTimeoutException te -> {
-                    System.err.println("Timed out: " + te.getMessage());
+                    Logger.error("{} -> Timed out: {}", name, te.getMessage());
                     throw te;
                 }
                 case GcodeErrorReplyException ee -> {
-                    System.err.println("Controller error: " + ee.command().reply());
+                    Logger.error("{} -> Controller error: {}",name, ee.command().reply());
                 }
                 case GcodeSendFailedException se -> {
-                    System.err.println("Couldn't send: " + se.getMessage());
+                    Logger.error("{} -> Couldn't send: {}",name, se.getMessage());
                 }
                 case GcodeRegexMismatchException re -> {
-                    System.err.println("Unexpected reply: " + re.command().reply());
+                    Logger.error("{} -> Unexpected reply: {}",name, re.command().reply());
                 }
                 default -> {
-                    System.err.println("Unknown failure: " + e.getCause());
+                    Logger.error("{} -> Unknown failure: {}",name, e.getCause());
                 }
             }
         } catch (InterruptedException e) {
@@ -335,6 +341,7 @@ public class AltGCodeDriver extends GcodeDriver {
             if( gcodeWriter.getBaseStream() == null ) {
                 gcodeWriter.setBaseStream( new SerialStream(comms.getPortName()) );
                 gcodeWriter.enableGlobalHomeTimeout(homeValidTimeout);
+                gcodeWriter.enableStepperTimeout("60s");
             }
             if (getFirmwareProperty("FIRMWARE_NAME", "").contains("Smoothie")){
                 System.out.println("Smoothieware detected, defaulting to two confirms.");
@@ -358,6 +365,8 @@ public class AltGCodeDriver extends GcodeDriver {
             Logger.error("TCP not supported yet");
             return;
         }
+        if( name.toLowerCase().contains("feeder") )
+            simulate=true;
         connected = false;
 
         startResponseHandler();

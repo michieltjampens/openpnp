@@ -27,6 +27,7 @@ public class GcodeWriter implements Writable {
     private ScheduledFuture<?> timeoutFuture;
 
     private long homeTimeout=-1;
+    private long steppersTimeout=60*1000;
     private long lastTimestamp=-1;
     private String id="gcodewriter";
 
@@ -48,7 +49,7 @@ public class GcodeWriter implements Writable {
         if( controller.isWritable()) {
             writer = (Writable) controller;
             controller.addTarget(this);
-            System.out.println("Adding "+id()+" as target ");
+            org.pmw.tinylog.Logger.debug("{} -> Adding {} as target ",controller.id(),id());
         }
     }
     public BaseStream getBaseStream() {
@@ -68,13 +69,26 @@ public class GcodeWriter implements Writable {
         this.homeTimeout=timeout;
         timedExecutor.schedule(this::homeValidTimeoutOccurred, timeout, TimeUnit.MILLISECONDS);
     }
+    public void enableStepperTimeout( String timeout ) {
+        long ms = GCodeTools.periodStringToMillis( timeout );
+        if( ms <= 5000 )
+            return;
+        this.steppersTimeout=ms;
+        timedExecutor.schedule( this::stepperDisableTimeoutOccurred, ms, TimeUnit.MILLISECONDS);
+    }
+    public void stepperDisableTimeoutOccurred(){
+        var left = timeLeft( steppersTimeout );
+        if( left == steppersTimeout )
+            sendGcode( GcodeCommand.create("M84") );
+        timedExecutor.schedule( this::stepperDisableTimeoutOccurred, left, TimeUnit.MILLISECONDS);
+    }
     public void drainCommandQueue(long timeout){
         // TODO Figure out what the purpose of this actually is?
     }
 
     public boolean sendGcode( GcodeCommand gCode ) {
         if (gCode == null || gCode.isInvalid()) {
-            Logger.warn("No valid gCode received");
+            org.pmw.tinylog.Logger.debug("{} -> No valid gCode received",id());
             return false;
         }
         if( inErrorState() ) {
@@ -87,11 +101,11 @@ public class GcodeWriter implements Writable {
                 .toList();
 
         if( list.isEmpty() ) {
-            org.pmw.tinylog.Logger.debug("{} empty command after pre process", controller.id());
+            org.pmw.tinylog.Logger.debug("{} -> Empty command after pre process", id());
             return false;
         }
         // Copied from
-        list.forEach( single -> org.pmw.tinylog.Logger.debug("[{}] >> {}, {}", controller.id(), single, gCode.timeout()));
+        list.forEach( single -> org.pmw.tinylog.Logger.debug("[{}] -> {}, {}", id(), single, gCode.timeout()));
 
         if( list.size() == 1 ) {
             addGcodeCommand( gCode );
@@ -115,25 +129,25 @@ public class GcodeWriter implements Writable {
     public STREAM_STATE addGcodeCommand( GcodeCommand cmd ){
         pendingCommands.offer( cmd );
         if( pendingCommands.size()==1) {
-            System.out.println(cmd.command()+" -> Nothing else in queue, send directly");
+            org.pmw.tinylog.Logger.debug("{} -> Queue empty, sending directly: {}",id(),cmd.command() );
             return sendCommand();
         }
         return state.get();
     }
     private synchronized STREAM_STATE sendCommand(){
 
-        if( !state.compareAndSet(STREAM_STATE.IDLE, STREAM_STATE.SEND_REQUEST)) {
-            System.out.println("-1 Wrong state:"+state );
-            return state.get();
-        }
         if (pendingCommands.isEmpty()) {
-            System.err.println("-2 Queue error");
+            org.pmw.tinylog.Logger.debug("{} -> -2 Queue error",id());
             state.compareAndSet(STREAM_STATE.IDLE, STREAM_STATE.QUEUE_ERROR);
             return state.get();
         }
-        //System.out.println("0 Pending before transmission: "+pendingCommands.size());
         var cmd = pendingCommands.getFirst();
-        //System.out.println("1 Sending:"+cmd.command()+" while state:"+state.get());
+
+        if( !cmd.command().equals("M999") && !state.compareAndSet(STREAM_STATE.IDLE, STREAM_STATE.SEND_REQUEST)) {
+            org.pmw.tinylog.Logger.debug("{} -> -1 Wrong state:{}",id(),state );
+            return state.get();
+        }
+
         cmd.markUnderway();
         if( writer.writeLine(id(),cmd.command()) ) { // No idea how long this takes
             lastTimestamp = Instant.now().toEpochMilli();
@@ -142,9 +156,13 @@ public class GcodeWriter implements Writable {
                     if( timeoutFuture != null ) {
                         timeoutFuture.cancel(true);
                     }
-                    timeoutFuture = timedExecutor.schedule(this::replyTimeoutOccurred, cmd.timeout(), TimeUnit.MILLISECONDS);
+                    if( cmd.timeout() !=-1 ) {
+                        timeoutFuture = timedExecutor.schedule(this::replyTimeoutOccurred, cmd.timeout(), TimeUnit.MILLISECONDS);
+                    }else {
+                        org.pmw.tinylog.Logger.debug("{} -> {} -> No timeout specified!",id(),cmd.command());
+                    }
                 } else {
-                    System.out.println("2b Transmission already handled: " + state.get());
+                    //System.out.println("2b Transmission already handled: " + state.get());
                 }
             }else{
                 // Reply already raced ahead and resolved the command before we could mark SEND_OK.
@@ -159,10 +177,10 @@ public class GcodeWriter implements Writable {
             cmd.markFailedToSend();
             pendingCommands.clear();    // Failed to send and no retry mechanism yet, so clear queue
             if( state.compareAndSet(STREAM_STATE.SEND_REQUEST, STREAM_STATE.SEND_ERROR) ) {
-                System.out.println("2c State changed to send_error");
+                org.pmw.tinylog.Logger.debug("{} -> 2c State changed to send_error",id());
                 responseQueue.add(cmd);
             }else{
-                System.err.println("2d State isn't SEND_REQUEST but "+state.get());
+                org.pmw.tinylog.Logger.debug("{} -> 2d State isn't SEND_REQUEST but {}",id(),state.get());
             }
         }
         //System.out.println("3 Finished send command for "+cmd.command()+" , pending: "+pendingCommands.size());
@@ -175,14 +193,14 @@ public class GcodeWriter implements Writable {
 
     private void stopWaiting(){
         if( state.get() != STREAM_STATE.WAITING) {
-            System.err.println("Somehow reached this while not waiting...? "+state.get());
+            org.pmw.tinylog.Logger.debug("{} -> Somehow reached this while not waiting...? {}",id(),state.get());
             return;
         }
         if( state.compareAndSet(STREAM_STATE.WAITING, STREAM_STATE.IDLE) ) {
-            System.out.println("Finished waiting, back to idle");
+            //System.out.println("Finished waiting, back to idle");
             sendCommand();
         }else{
-            System.err.println("Somehow state change since if? "+state.get());
+            org.pmw.tinylog.Logger.debug("{} -> Somehow state change since if? {}",id(),state.get());
         }
     }
 
@@ -198,17 +216,22 @@ public class GcodeWriter implements Writable {
         } else if (previous == STREAM_STATE.IDLE) {
             // reply already arrived and transitioned us to IDLE before the timeout fired —
             // this timeout is stale/spurious, the future should've been cancelled but wasn't
-            System.out.println("Stale timeout fired, already IDLE — ignoring");
+            org.pmw.tinylog.Logger.debug("{} -> Stale timeout fired, already IDLE — ignoring",id());
             // don't double-complete cmd, don't fire callbacks for a finished command
         }
     }
     private void homeValidTimeoutOccurred(){
-        var left = Instant.now().toEpochMilli() - lastTimestamp;
-        if( left+5 > homeTimeout || lastTimestamp==-1){ // Some margin
+        var left = timeLeft( homeTimeout);
+        if( left == homeTimeout)
             responseQueue.add( GcodeCommand.create("unhome").markAsUnsolicited() );
-            left = homeTimeout;
-        }
         timedExecutor.schedule(this::homeValidTimeoutOccurred, left, TimeUnit.MILLISECONDS);
+    }
+    private long timeLeft( long timeout ){
+        var left = Instant.now().toEpochMilli() - lastTimestamp;
+        if( left+5 > timeout || lastTimestamp==-1){ // Some margin
+            left = timeout;
+        }
+        return left;
     }
     /* ***** Writable  **** */
     @Override
@@ -222,7 +245,7 @@ public class GcodeWriter implements Writable {
             timeoutFuture.cancel(true);
         }
         if( pendingCommands.isEmpty() ) {
-            System.out.println(id+" -> Received line: "+msg+ " but nothing pending");
+            org.pmw.tinylog.Logger.debug("{} -> eceived line: {} but nothing pending",id(),msg);
             responseQueue.offer( GcodeCommand.createDummy("dummy:"+msg) );
             return true;
         }
@@ -234,7 +257,7 @@ public class GcodeWriter implements Writable {
             if( state.compareAndSet(STREAM_STATE.SEND_OK, STREAM_STATE.WAITING) ) {
                 timedExecutor.schedule(this::stopWaiting, rules.getDollarWaitTimeMilliseconds(), TimeUnit.MILLISECONDS);
             }else{
-                System.out.println("Tried to wait, but state was wrong: "+state.get());
+                org.pmw.tinylog.Logger.debug("{} -> Tried to wait, but state was wrong: {}",id(),state.get());
             }
         }
         if( !rules.isErrorMessage(msg) ){ // Or try again logic?
@@ -244,7 +267,7 @@ public class GcodeWriter implements Writable {
             }else if( item.isReceived()){
                 return true;
             }else if( item.isRegexFailed() ){
-                System.out.println("NOT confirmed:"+item.command());
+                org.pmw.tinylog.Logger.debug("{} -> NOT confirmed: {}",id(),item.command());
                 if( item.alsoCheckNextLine()) // Allows checking multiple lines
                     return true;
                 pendingCommands.removeFirst();
@@ -255,11 +278,11 @@ public class GcodeWriter implements Writable {
                    // System.out.println("More work to do!");
                     sendCommand();
                 }else{
-                    System.out.println( item.command() +" -> Was last in queue, going idle");
-                    System.out.println( "----------------------------------------------");
+                    org.pmw.tinylog.Logger.debug("{} -> {} Was last in queue, going idle",id(),item.command());
+                    org.pmw.tinylog.Logger.debug("----------------------------------------------");
                 }
             }else{
-                System.out.println(item.command()+ " -> Not back to idle because: "+state.get());
+                org.pmw.tinylog.Logger.debug(" -> {} not back to idle because {} ",id(),item.command(),state.get());
             }
         }else{
             // TODO Try again or give up or flush queue? For now copy original and just give up
@@ -272,7 +295,7 @@ public class GcodeWriter implements Writable {
 
     @Override
     public String id() {
-        return id;
+        return id+"/"+controller.id();
     }
 
     @Override

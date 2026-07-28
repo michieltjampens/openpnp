@@ -111,12 +111,22 @@ public class DipTraceImporter implements BoardImporter {
                 continue;
             }
             line = line.trim();
-            
+            line = line.replace("\"",""); // Remove " if present
             String[] tokens = line.split(","); //$NON-NLS-1$
             
-            String placementId = tokens[0];  							// RefDes in Diptrace export
-            String partValue = tokens[6];    							// Value in Diptrace export
+            String placementId = tokens[0];
+            // RefDes in Diptrace export
+            String partValue = "";
+            if( placementId.startsWith("FID") && tokens.length==6){
+                partValue = "fiducial";
+            }else{
+                partValue = tokens[6];    							// Value in Diptrace export
+            }
+
             String pkgName = tokens[1];      							// Name in Diptrace export
+            if( pkgName.isEmpty() ) {
+                pkgName = "Empty";
+            }
             double placementX = Double.parseDouble(tokens[2]);   		// X (mm) in Diptrace export
             double placementY = Double.parseDouble(tokens[3]);   		// Y (mm) in Diptrace export
             double placementRotation = Double.parseDouble(tokens[5]); 	// Rotate in Diptrace export
@@ -130,9 +140,11 @@ public class DipTraceImporter implements BoardImporter {
                 String partId = pkgName + "-" + partValue; //$NON-NLS-1$
                 Part part = cfg.getPart(partId);
                 if (part == null) {
+                    System.out.println("Adding new part: "+ partId);
                     part = new Part(partId);
                     Package pkg = cfg.getPackage(pkgName);
                     if (pkg == null) {
+                        System.out.println("Adding new package: "+ pkgName);
                         pkg = new Package(pkgName);
                         cfg.addPackage(pkg);
                     }
@@ -146,6 +158,7 @@ public class DipTraceImporter implements BoardImporter {
 
             placement.setSide(placementLayer.charAt(0) == 'T' ? Side.Top : Side.Bottom);
             placements.add(placement);
+            System.out.println("Placement added : "+placement);
         }
         reader.close();
         return placements;

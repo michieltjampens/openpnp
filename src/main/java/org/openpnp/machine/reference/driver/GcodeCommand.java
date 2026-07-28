@@ -50,7 +50,9 @@ public class GcodeCommand {
         }
         this.command = command.strip();
     }
-
+    public String toString(){
+        return "CMD:"+command+"->"+reply();
+    }
     public String command(){
         return command;
     }
@@ -159,25 +161,25 @@ public class GcodeCommand {
                 future.orTimeout(timeout + 100, TimeUnit.MILLISECONDS);
             }
         }
-        System.out.println(command+ " -> Underway to controller.");
+        ///System.out.println(command+ " -> Underway to controller.");
     }
     public boolean markSendOk(){
         sendTimestamp= Instant.now().toEpochMilli();
         if( state.compareAndSet(COMMAND_STATE.UNDERWAY,COMMAND_STATE.SEND_OK) ) {
-            System.out.println(command + " -> Send succeeded.");
+           // System.out.println(command + " -> Send succeeded.");
             return true;
         }else if( state.get() == COMMAND_STATE.RECEIVE_OK ){
-            System.out.println(command + " -> Not marking send ok because already received.");
+           // System.out.println(command + " -> Not marking send ok because already received.");
             return false;
         }else{
-            System.out.println( command+" -> Not marking as send because "+state.get());
+           // System.out.println( command+" -> Not marking as send because "+state.get());
             return false;
         }
     }
     public void markFailedToSend(){
         sendTimestamp= Instant.now().toEpochMilli();
         if( state.compareAndSet(COMMAND_STATE.UNDERWAY,COMMAND_STATE.FAILED_SEND) ){
-            System.out.println(command+" -> Failed to send.");
+           // System.out.println(command+" -> Failed to send.");
         }else{
             System.err.println( command+" -> Not marking as failed to send because "+state.get());
         }
@@ -190,15 +192,15 @@ public class GcodeCommand {
         if( confirmRegex.test(reply) ){
             if( confirmsNeeded == 2 && state.compareAndSet(COMMAND_STATE.SEND_OK,COMMAND_STATE.RECEIVE_OK) ){
                 confirmsNeeded--;
-                System.out.println(command+" -> Receival confirmed.");
+                //System.out.println(command+" -> Receival confirmed.");
             }else if( state.compareAndSet(COMMAND_STATE.SEND_OK,COMMAND_STATE.CONFIRMED) ){
-                System.out.println( command+" -> Confirmed with " +reply);
+                //System.out.println( command+" -> Confirmed with " +reply);
             }else if( state.compareAndSet(COMMAND_STATE.RECEIVE_OK,COMMAND_STATE.CONFIRMED) ){
-                System.out.println( command+" -> Confirmed after receival with " +reply);
+               // System.out.println( command+" -> Confirmed after receival with " +reply);
             }else if( state.compareAndSet(COMMAND_STATE.UNDERWAY,COMMAND_STATE.CONFIRMED ) ){
-                System.out.println( command+" -> Confirmed with " +reply+" while considered underway!");
+               // System.out.println( command+" -> Confirmed with " +reply+" while considered underway!");
             }else if( state.compareAndSet(COMMAND_STATE.CONFIRM_REGEX_FAILED,COMMAND_STATE.CONFIRMED ) ){
-                System.out.println( command+" -> Confirmed with " +reply+" after receiving a bad one earlier");
+              //  System.out.println( command+" -> Confirmed with " +reply+" after receiving a bad one earlier");
             }else{
                 System.err.println( command+" -> Want to mark confirmed but it's now "+state.get());
             }
@@ -206,10 +208,10 @@ public class GcodeCommand {
                 completeFuture();
         }else{
             if( state.compareAndSet(COMMAND_STATE.SEND_OK,COMMAND_STATE.CONFIRM_REGEX_FAILED) ){
-                System.out.println(command+" -> Transitioned from SEND_OK to "+state.get());
-                System.out.println( command+" -> Regex failed on "+reply + " vs "+originalRegex );
+                //System.out.println(command+" -> Transitioned from SEND_OK to "+state.get());
+               // System.out.println( command+" -> Regex failed on "+reply + " vs "+originalRegex );
             }else if( state.compareAndSet(COMMAND_STATE.UNDERWAY,COMMAND_STATE.CONFIRM_REGEX_FAILED ) ){
-                System.out.println( command+" -> Regex failed on "+reply+", even before send_ok, marking as regex_failed...");
+               // System.out.println( command+" -> Regex failed on "+reply+", even before send_ok, marking as regex_failed...");
             }else if( state.get() != COMMAND_STATE.CONFIRM_REGEX_FAILED ){ // If not already regex failed
                 System.err.println( command+" -> Want to mark confirmed_regex_failed but it's now "+state.get());
             }
@@ -222,9 +224,9 @@ public class GcodeCommand {
         if( state.compareAndSet(COMMAND_STATE.SEND_OK,COMMAND_STATE.TIMEOUT) ) {
             System.out.println(command+" -> Marked as timeout after "+state.get());
         }else if( state.get() == COMMAND_STATE.CONFIRM_REGEX_FAILED ){
-            System.out.println(command+" -> Didn't mark as timeout because a failed regex earlier.");
+           // System.out.println(command+" -> Didn't mark as timeout because a failed regex earlier.");
         }else{
-            System.err.println(command+" -> Couldn't mark as timeout because "+state.get());
+         //   System.err.println(command+" -> Couldn't mark as timeout because "+state.get());
         }
         completeFuture();
     }
@@ -232,9 +234,9 @@ public class GcodeCommand {
         if( state.compareAndSet(COMMAND_STATE.SEND_OK,COMMAND_STATE.ERROR_REPLY) ){
             System.out.println(command+" -> Transitioned from SEND_OK to "+state.get());
         }else if( state.compareAndSet(COMMAND_STATE.UNDERWAY,COMMAND_STATE.ERROR_REPLY ) ){
-            System.out.println( command+" -> Was matched to error before marked as send...");
+          //  System.out.println( command+" -> Was matched to error before marked as send...");
         }else{
-            System.out.println( command+" -> Want to mark as an error reply but it's now "+state.get());
+        //    System.out.println( command+" -> Want to mark as an error reply but it's now "+state.get());
         }
         completeFuture();
     }
